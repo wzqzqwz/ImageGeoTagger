@@ -5,9 +5,9 @@ from tkinter import ttk
 import threading
 import traceback
 
-from geo_media_tool.ui.geo_tab import GeoTab
-from geo_media_tool.ui.date_tab import DateTab
-from geo_media_tool.utils.i18n import _, get_language, load_lang, get_supported_languages, set_language
+from ImageGeoTagger.ui.geo_tab import GeoTab
+from ImageGeoTagger.ui.date_tab import DateTab
+from ImageGeoTagger.utils.i18n import _, get_language, load_lang, get_supported_languages, set_language
 
 
 class MainWindow:

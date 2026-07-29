@@ -12,17 +12,17 @@ from datetime import datetime
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from geo_media_tool.config import (
+from ImageGeoTagger.config import (
     VIDEO_EXTENSIONS, ALL_MEDIA_EXTENSIONS
 )
-from geo_media_tool.utils.exif_utils import (
+from ImageGeoTagger.utils.exif_utils import (
     extract_exif_gps, extract_pil_gps, extract_video_gps_with_exiftool,
     read_exif_datetime, read_quicktime_datetime
 )
-from geo_media_tool.utils.gpx_utils import parse_gpx_file
-from geo_media_tool.utils.media_utils import get_file_creation_datetime
-from geo_media_tool.models.media_file import MediaFileInfo
-from geo_media_tool.models.gps_data import GpsPoint
+from ImageGeoTagger.utils.gpx_utils import parse_gpx_file
+from ImageGeoTagger.utils.media_utils import get_file_creation_datetime
+from ImageGeoTagger.models.media_file import MediaFileInfo
+from ImageGeoTagger.models.gps_data import GpsPoint
 
 
 def scan_folder(folder_path, progress_callback=None, only_process_with_date=False,
@@ -52,10 +52,10 @@ def scan_folder(folder_path, progress_callback=None, only_process_with_date=Fals
     files = []
 
     # 合并遍历：一次 os.walk 同时收集 GPX 和媒体文件
-    for r, _, fs in os.walk(folder_path):
-        for f in fs:
-            ext = os.path.splitext(f)[1].lower()
-            try:
+    try:
+        for r, _, fs in os.walk(folder_path):
+            for f in fs:
+                ext = os.path.splitext(f)[1].lower()
                 if ext == '.gpx':
                     gpx_path = os.path.join(r, f)
                     points = parse_gpx_file(gpx_path)
@@ -70,9 +70,8 @@ def scan_folder(folder_path, progress_callback=None, only_process_with_date=Fals
                         ))
                 elif ext in ALL_MEDIA_EXTENSIONS:
                     files.append(os.path.join(r, f))
-            except PermissionError:
-                import traceback
-                traceback.print_exc()
+    except PermissionError:
+        pass
 
     if not files:
         return [], [], gps_data, 0, 0

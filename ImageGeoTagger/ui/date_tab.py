@@ -2,7 +2,7 @@
 
 import tkinter as tk
 from tkinter import ttk, filedialog
-from geo_media_tool.ui import custom_msgbox as messagebox
+from ImageGeoTagger.ui import custom_msgbox as messagebox
 import os
 import platform
 import threading
@@ -12,20 +12,20 @@ from datetime import datetime
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from geo_media_tool.services.date_processor import (
+from ImageGeoTagger.services.date_processor import (
     MediaDateRenamer, update_file_shooting_date
 )
-from geo_media_tool.utils.media_utils import (
+from ImageGeoTagger.utils.media_utils import (
     parse_datetime_from_filename, get_existing_datetime, is_media_file
 )
-from geo_media_tool.config import ALL_MEDIA_EXTENSIONS
-from geo_media_tool.ui.dialogs import (
+from ImageGeoTagger.config import ALL_MEDIA_EXTENSIONS
+from ImageGeoTagger.ui.dialogs import (
     EditShootingDateDialog, CompletionDialog
 )
-from geo_media_tool.utils.platform_utils import open_file_with_system, show_file_in_explorer
-from geo_media_tool.utils.recycle_bin import send_to_recycle_bin
-from geo_media_tool.utils.i18n import _
-from geo_media_tool.models.media_file import FileStatus, status_text, status_sort_key
+from ImageGeoTagger.utils.platform_utils import open_file_with_system, show_file_in_explorer
+from ImageGeoTagger.utils.recycle_bin import send_to_recycle_bin
+from ImageGeoTagger.utils.i18n import _
+from ImageGeoTagger.models.media_file import FileStatus, status_text, status_sort_key
 try:
     from tkinterdnd2 import DND_FILES
 except ImportError:

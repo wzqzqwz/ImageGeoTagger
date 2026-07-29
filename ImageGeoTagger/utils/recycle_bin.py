@@ -10,7 +10,7 @@ import subprocess
 import shutil
 from pathlib import Path
 
-from geo_media_tool.utils.i18n import _
+from ImageGeoTagger.utils.i18n import _
 
 
 def send_to_recycle_bin(file_paths):

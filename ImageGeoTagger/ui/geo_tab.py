@@ -2,24 +2,24 @@
 
 import tkinter as tk
 from tkinter import ttk, filedialog
-from geo_media_tool.ui import custom_msgbox as messagebox
+from ImageGeoTagger.ui import custom_msgbox as messagebox
 import os
 import platform as _platform
 import threading
 from datetime import datetime
 
-from geo_media_tool.services.media_scanner import scan_folder
-from geo_media_tool.services.geo_processor import process_location_info
-from geo_media_tool.services.export_service import (
+from ImageGeoTagger.services.media_scanner import scan_folder
+from ImageGeoTagger.services.geo_processor import process_location_info
+from ImageGeoTagger.services.export_service import (
     export_to_txt, export_to_csv, export_to_json, export_to_gpx,
     generate_statistics,
 )
-from geo_media_tool.ui.dialogs import (
+from ImageGeoTagger.ui.dialogs import (
     EditCoordinatesDialog, GpxPointDetails,
     BatchDateEditDialog, BatchLocationEditDialog
 )
-from geo_media_tool.utils.i18n import _
-from geo_media_tool.config import ALL_MEDIA_EXTENSIONS
+from ImageGeoTagger.utils.i18n import _
+from ImageGeoTagger.config import ALL_MEDIA_EXTENSIONS
 try:
     from tkinterdnd2 import DND_FILES
 except ImportError:
@@ -233,7 +233,7 @@ class GeoTab:
                     self.app.is_processing)
 
     def ensure_exiftool_available(self):
-        from geo_media_tool.utils.exif_utils import check_exiftool
+        from ImageGeoTagger.utils.exif_utils import check_exiftool
         available, _ = check_exiftool()
         if not available:
             messagebox.showwarning(_("ExifTool未安装"),
@@ -466,7 +466,7 @@ class GeoTab:
         if file_info.latitude is None or file_info.longitude is None:
             return
         import webbrowser
-        from geo_media_tool.config import AMAP_URL, BMAP_URL, TMAP_URL, APPLE_MAPS_URL
+        from ImageGeoTagger.config import AMAP_URL, BMAP_URL, TMAP_URL, APPLE_MAPS_URL
         lat, lon = file_info.latitude, file_info.longitude
         system = _platform.system()
         map_label = _("图像拍摄位置")
@@ -513,7 +513,7 @@ class GeoTab:
             except Exception:
                 traceback.print_exc()
 
-        from geo_media_tool.ui.results_window import ResultsWindow
+        from ImageGeoTagger.ui.results_window import ResultsWindow
         self.result_window = ResultsWindow(self)
 
     def export_results(self):

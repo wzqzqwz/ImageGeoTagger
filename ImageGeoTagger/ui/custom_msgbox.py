@@ -3,7 +3,7 @@
 import platform
 import tkinter as tk
 from tkinter import ttk
-from geo_media_tool.utils.i18n import _
+from ImageGeoTagger.utils.i18n import _
 
 
 class _MessageBoxDialog:

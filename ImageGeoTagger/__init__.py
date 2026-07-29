@@ -10,5 +10,5 @@
 """
 
 # 软件版本号和作者信息
-__version__ = "3.0.0"
+__version__ = "1.0.0"
 __author__ = "Media Tool Team"

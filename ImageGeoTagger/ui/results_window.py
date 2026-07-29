@@ -2,22 +2,22 @@
 
 import tkinter as tk
 from tkinter import ttk
-from geo_media_tool.ui import custom_msgbox as messagebox
+from ImageGeoTagger.ui import custom_msgbox as messagebox
 import platform
 import os
 import traceback
 from datetime import datetime
 
-from geo_media_tool.ui.dialogs import (
+from ImageGeoTagger.ui.dialogs import (
     EditCoordinatesDialog, BatchDateEditDialog,
     BatchLocationEditDialog, EditShootingDateDialog, GpxPointDetails
 )
-from geo_media_tool.utils.recycle_bin import send_to_recycle_bin
-from geo_media_tool.utils.platform_utils import open_file_with_system, show_file_in_explorer
-from geo_media_tool.services.export_service import (
+from ImageGeoTagger.utils.recycle_bin import send_to_recycle_bin
+from ImageGeoTagger.utils.platform_utils import open_file_with_system, show_file_in_explorer
+from ImageGeoTagger.services.export_service import (
     generate_statistics
 )
-from geo_media_tool.utils.i18n import _
+from ImageGeoTagger.utils.i18n import _
 
 
 class ResultsWindow:
@@ -487,7 +487,6 @@ class ResultsWindow:
                 self.window.destroy()
             except Exception:
                 traceback.print_exc()
-            self.geo_tab.result_window = None
             self.geo_tab.show_results()
 
     def _setup_gpx_tab(self, notebook):
@@ -630,7 +629,7 @@ class ResultsWindow:
         if not fp:
             return
         try:
-            from geo_media_tool.utils.gpx_utils import create_gpx_element, prettify_xml
+            from ImageGeoTagger.utils.gpx_utils import create_gpx_element, prettify_xml
             pts = [point] if not isinstance(point, list) else point
             root = create_gpx_element(pts, _("图像位置信息导出"))
             with open(fp, 'w', encoding='utf-8', newline='') as f:

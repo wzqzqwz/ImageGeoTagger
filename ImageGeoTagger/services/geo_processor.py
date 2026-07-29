@@ -17,11 +17,11 @@ import traceback
 from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from geo_media_tool.config import RAW_EXTENSIONS, VIDEO_EXTENSIONS, AUDIO_EXTENSIONS
-from geo_media_tool.utils.exif_utils import (
+from ImageGeoTagger.config import RAW_EXTENSIONS, VIDEO_EXTENSIONS, AUDIO_EXTENSIONS
+from ImageGeoTagger.utils.exif_utils import (
     update_image_gps, update_raw_gps, update_video_gps, update_audio_gps
 )
-from geo_media_tool.utils.i18n import _
+from ImageGeoTagger.utils.i18n import _
 
 
 def _get_dt(obj):

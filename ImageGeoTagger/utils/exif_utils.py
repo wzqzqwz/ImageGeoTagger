@@ -28,10 +28,10 @@ import exifread
 from PIL import Image
 from PIL.ExifTags import TAGS, GPSTAGS
 import piexif
-from geo_media_tool.utils.i18n import _
+from ImageGeoTagger.utils.i18n import _
 
-from geo_media_tool.config import RAW_EXTENSIONS, VIDEO_EXTENSIONS, AUDIO_EXTENSIONS, PIE_SUPPORTED_EXTENSIONS
-from geo_media_tool.utils.platform_utils import get_startupinfo, get_app_dir
+from ImageGeoTagger.config import RAW_EXTENSIONS, VIDEO_EXTENSIONS, AUDIO_EXTENSIONS, PIE_SUPPORTED_EXTENSIONS
+from ImageGeoTagger.utils.platform_utils import get_startupinfo, get_app_dir
 
 
 def _get_stat(file_path):
@@ -228,12 +228,12 @@ def get_exiftool_path():
     if system == "Windows":
         names = ['exiftool.exe', 'exiftool(-k).exe']
         sysdirs = os.environ.get('PATH', '').split(os.pathsep)
-        from geo_media_tool.config import WINDOWS_EXIFTOOL_PATHS
+        from ImageGeoTagger.config import WINDOWS_EXIFTOOL_PATHS
         sysdirs += WINDOWS_EXIFTOOL_PATHS
     else:
         names = ['exiftool']
         sysdirs = os.environ.get('PATH', '').split(os.pathsep)
-        from geo_media_tool.config import UNIX_EXIFTOOL_PATHS
+        from ImageGeoTagger.config import UNIX_EXIFTOOL_PATHS
         sysdirs += UNIX_EXIFTOOL_PATHS
 
     app_dir = get_app_dir()
