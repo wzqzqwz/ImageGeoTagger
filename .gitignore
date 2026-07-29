@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project specific
+backup*/
+*backup*/
+*.bak
+temp_exiftool/
+exiftool/
+exiftool.exe
+exiftool_files/
+nfo.plist
+
+# Logs
+*.log
+
+# Root-level temp/build scripts (exclude specific legacy files)
+/2233.py
+/build.py
+/image_geo_tagger.py
+/image_geo_tagger2.py
+/image_metadata_processor.py
+/整合*.py
+/PortableGit.exe
