@@ -2,7 +2,7 @@
 
 import tkinter as tk
 from tkinter import ttk, filedialog
-from ImageGeoTagger.ui import custom_msgbox as messagebox
+from ui import custom_msgbox as messagebox
 import os
 import platform
 import threading
@@ -12,20 +12,20 @@ from datetime import datetime
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from ImageGeoTagger.services.date_processor import (
+from services.date_processor import (
     MediaDateRenamer, update_file_shooting_date
 )
-from ImageGeoTagger.utils.media_utils import (
+from utils.media_utils import (
     parse_datetime_from_filename, get_existing_datetime, is_media_file
 )
-from ImageGeoTagger.config import ALL_MEDIA_EXTENSIONS
-from ImageGeoTagger.ui.dialogs import (
+from config import ALL_MEDIA_EXTENSIONS
+from ui.dialogs import (
     EditShootingDateDialog, CompletionDialog
 )
-from ImageGeoTagger.utils.platform_utils import open_file_with_system, show_file_in_explorer
-from ImageGeoTagger.utils.recycle_bin import send_to_recycle_bin
-from ImageGeoTagger.utils.i18n import _
-from ImageGeoTagger.models.media_file import FileStatus, status_text, status_sort_key
+from utils.platform_utils import open_file_with_system, show_file_in_explorer
+from utils.recycle_bin import send_to_recycle_bin
+from utils.i18n import _
+from models.media_file import FileStatus, status_text, status_sort_key
 try:
     from tkinterdnd2 import DND_FILES
 except ImportError:

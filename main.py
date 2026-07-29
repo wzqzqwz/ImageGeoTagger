@@ -5,7 +5,7 @@
 """
 
 import tkinter as tk
-from ImageGeoTagger.ui import custom_msgbox as messagebox
+from ui import custom_msgbox as messagebox
 import os
 import platform
 import traceback
@@ -17,9 +17,9 @@ try:
 except ImportError:
     _HAS_DND = False
     TkinterDnD = None
-from ImageGeoTagger.ui.main_window import MainWindow
-from ImageGeoTagger.utils.platform_utils import hide_console_window, get_app_dir
-from ImageGeoTagger.utils.i18n import _, load_lang
+from ui.main_window import MainWindow
+from utils.platform_utils import hide_console_window, get_app_dir
+from utils.i18n import _, load_lang
 
 
 def main():

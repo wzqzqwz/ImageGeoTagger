@@ -6,8 +6,8 @@ import json
 from datetime import datetime
 from collections.abc import Mapping
 
-from ImageGeoTagger.utils.gpx_utils import create_gpx_element, prettify_xml
-from ImageGeoTagger.utils.i18n import _
+from utils.gpx_utils import create_gpx_element, prettify_xml
+from utils.i18n import _
 
 
 def _get_val(item, key, default=None):

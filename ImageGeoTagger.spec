@@ -24,8 +24,8 @@ a = Analysis(
     pathex=[app_dir],
     binaries=[],
     datas=[
-        (locale_dir, 'ImageGeoTagger\\locales'),
-        (icon_dir, 'ImageGeoTagger\\icons'),
+        (locale_dir, 'locales'),
+        (icon_dir, 'icons'),
         (os.path.join(app_dir, 'icon.ico'), '.'),
         (os.path.join(app_dir, 'icons', 'icon.png'), '.'),
     ] + exiftool_datas,

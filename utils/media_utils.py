@@ -14,8 +14,8 @@ import traceback
 from datetime import datetime
 from pathlib import Path
 
-from ImageGeoTagger.config import ALL_MEDIA_EXTENSIONS, DATETIME_PATTERNS
-from ImageGeoTagger.utils.exif_utils import read_exif_datetime, read_quicktime_datetime
+from config import ALL_MEDIA_EXTENSIONS, DATETIME_PATTERNS
+from utils.exif_utils import read_exif_datetime, read_quicktime_datetime
 
 
 def is_media_file(file_path):

@@ -9,7 +9,7 @@ import sys
 import traceback
 import platform
 import subprocess
-from ImageGeoTagger.utils.i18n import _
+from utils.i18n import _
 
 
 def get_app_dir():

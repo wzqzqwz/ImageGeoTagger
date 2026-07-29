@@ -12,17 +12,17 @@ from datetime import datetime
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from ImageGeoTagger.config import (
+from config import (
     VIDEO_EXTENSIONS, ALL_MEDIA_EXTENSIONS
 )
-from ImageGeoTagger.utils.exif_utils import (
+from utils.exif_utils import (
     extract_exif_gps, extract_pil_gps, extract_video_gps_with_exiftool,
     read_exif_datetime, read_quicktime_datetime
 )
-from ImageGeoTagger.utils.gpx_utils import parse_gpx_file
-from ImageGeoTagger.utils.media_utils import get_file_creation_datetime
-from ImageGeoTagger.models.media_file import MediaFileInfo
-from ImageGeoTagger.models.gps_data import GpsPoint
+from utils.gpx_utils import parse_gpx_file
+from utils.media_utils import get_file_creation_datetime
+from models.media_file import MediaFileInfo
+from models.gps_data import GpsPoint
 
 
 def scan_folder(folder_path, progress_callback=None, only_process_with_date=False,

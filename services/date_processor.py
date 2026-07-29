@@ -10,12 +10,12 @@
 from datetime import datetime
 from pathlib import Path
 
-from ImageGeoTagger.config import IMAGE_EXTENSIONS, RAW_EXTENSIONS, VIDEO_EXTENSIONS, AUDIO_EXTENSIONS
-from ImageGeoTagger.utils.i18n import _
-from ImageGeoTagger.utils.media_utils import (
+from config import IMAGE_EXTENSIONS, RAW_EXTENSIONS, VIDEO_EXTENSIONS, AUDIO_EXTENSIONS
+from utils.i18n import _
+from utils.media_utils import (
     parse_datetime_from_filename, get_existing_datetime
 )
-from ImageGeoTagger.utils.exif_utils import (
+from utils.exif_utils import (
     read_exif_datetime, update_image_date, update_raw_date,
     update_video_date, update_audio_date, blank_exif_dates,
     clear_video_date, clear_audio_date

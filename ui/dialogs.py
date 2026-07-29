@@ -9,8 +9,8 @@ from datetime import datetime
 
 import tkinter as tk
 from tkinter import ttk
-from ImageGeoTagger.ui import custom_msgbox as messagebox
-from ImageGeoTagger.utils.i18n import _
+from ui import custom_msgbox as messagebox
+from utils.i18n import _
 
 MAP_SELECTOR_URL = "https://maps.apple.com"
 MAP_SELECTOR_URL_BACKUP = "https://guihuayun.com/maps/getxy.php?area"
@@ -33,17 +33,17 @@ def _is_url_reachable(url):
     except Exception:
         return False
 
-from ImageGeoTagger.utils.exif_utils import (
+from utils.exif_utils import (
     update_image_gps, update_raw_gps, update_video_gps, update_audio_gps,
     remove_gps_info
 )
-from ImageGeoTagger.config import RAW_EXTENSIONS, VIDEO_EXTENSIONS, AUDIO_EXTENSIONS
-from ImageGeoTagger.models.media_file import FileStatus, get_val
-from ImageGeoTagger.services.date_processor import (
+from config import RAW_EXTENSIONS, VIDEO_EXTENSIONS, AUDIO_EXTENSIONS
+from models.media_file import FileStatus, get_val
+from services.date_processor import (
     update_file_shooting_date, clear_file_shooting_date
 )
-from ImageGeoTagger.utils.platform_utils import open_file_with_system
-from ImageGeoTagger.services.geo_processor import (
+from utils.platform_utils import open_file_with_system
+from services.geo_processor import (
     find_files_with_same_location, batch_update_same_location_files
 )
 
@@ -918,7 +918,7 @@ class BatchDateEditDialog:
                 return
 
             from concurrent.futures import ThreadPoolExecutor, as_completed
-            from ImageGeoTagger.services.date_processor import update_file_shooting_date
+            from services.date_processor import update_file_shooting_date
 
             def process_one(fi):
                 try:

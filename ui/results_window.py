@@ -2,22 +2,22 @@
 
 import tkinter as tk
 from tkinter import ttk
-from ImageGeoTagger.ui import custom_msgbox as messagebox
+from ui import custom_msgbox as messagebox
 import platform
 import os
 import traceback
 from datetime import datetime
 
-from ImageGeoTagger.ui.dialogs import (
+from ui.dialogs import (
     EditCoordinatesDialog, BatchDateEditDialog,
     BatchLocationEditDialog, EditShootingDateDialog, GpxPointDetails
 )
-from ImageGeoTagger.utils.recycle_bin import send_to_recycle_bin
-from ImageGeoTagger.utils.platform_utils import open_file_with_system, show_file_in_explorer
-from ImageGeoTagger.services.export_service import (
+from utils.recycle_bin import send_to_recycle_bin
+from utils.platform_utils import open_file_with_system, show_file_in_explorer
+from services.export_service import (
     generate_statistics
 )
-from ImageGeoTagger.utils.i18n import _
+from utils.i18n import _
 
 
 class ResultsWindow:
@@ -629,7 +629,7 @@ class ResultsWindow:
         if not fp:
             return
         try:
-            from ImageGeoTagger.utils.gpx_utils import create_gpx_element, prettify_xml
+            from utils.gpx_utils import create_gpx_element, prettify_xml
             pts = [point] if not isinstance(point, list) else point
             root = create_gpx_element(pts, _("图像位置信息导出"))
             with open(fp, 'w', encoding='utf-8', newline='') as f:

@@ -4,7 +4,7 @@ import enum
 import os
 from datetime import datetime
 
-from ImageGeoTagger.utils.i18n import _
+from utils.i18n import _
 
 
 class FileStatus(enum.Enum):
