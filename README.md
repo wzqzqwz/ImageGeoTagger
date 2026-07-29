@@ -69,6 +69,21 @@ pip install pyinstaller
 pyinstaller ImageGeoTagger.spec
 ```
 
+## 多语言支持
+
+内置国际化支持，当前支持以下语言：
+
+| 语言 | 代码 |
+|------|------|
+| 中文 (简体) | `zh` |
+| English | `en` |
+| Español | `es` |
+| Français | `fr` |
+| Русский | `ru` |
+| العربية | `ar` |
+
+可在设置菜单中切换语言。
+
 ## 许可证
 
 MIT License
