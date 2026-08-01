@@ -163,8 +163,13 @@ def process_location_info(a_list, b_list, gps_data, threshold_minutes=30,
                 key=lambda x: _to_utc_naive(_get_dt(x)) or datetime.min
             )
     finally:
-        match_pool.shutdown(wait=False)
-        write_pool.shutdown(wait=False)
+        # wait=True 确保所有已提交的写文件任务完成后再返回，
+        # 避免窗口关闭时写入被截断导致文件损坏
+        try:
+            match_pool.shutdown(wait=True)
+            write_pool.shutdown(wait=True)
+        except Exception:
+            traceback.print_exc()
 
     # 最终按时间排序两个列表（统一时区后再排序）
     a_list.sort(key=lambda x: _to_utc_naive(x.dt) if x.dt else datetime.min)
@@ -243,7 +248,8 @@ def _find_closest_by_time(target_time, sorted_ref, threshold_minutes):
         ref_dt = _to_utc_naive(ref_dt)
         diff = abs(ref_dt - target_time)
 
-        if diff < best_diff:
+        # 用 <= 确保时间差恰好等于阈值的点也能被匹配（边界情况）
+        if diff <= best_diff:
             best_diff = diff
             best = sorted_ref[mid]
             best_idx = mid
@@ -266,7 +272,7 @@ def _find_closest_by_time(target_time, sorted_ref, threshold_minutes):
             continue
         ref_dt = _to_utc_naive(ref_dt)
         diff = abs(ref_dt - target_time)
-        if diff < best_diff:
+        if diff <= best_diff:
             best_diff = diff
             best = sorted_ref[l]
         elif diff > best_diff:
@@ -280,7 +286,7 @@ def _find_closest_by_time(target_time, sorted_ref, threshold_minutes):
             continue
         ref_dt = _to_utc_naive(ref_dt)
         diff = abs(ref_dt - target_time)
-        if diff < best_diff:
+        if diff <= best_diff:
             best_diff = diff
             best = sorted_ref[r]
         elif diff > best_diff:

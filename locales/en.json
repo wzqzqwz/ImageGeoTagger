@@ -61,7 +61,7 @@
   " =====\n": " =====\n",
   " GB": " GB",
   " MB": " MB",
-  " 个\n": "\n",
+  " 个\n": " file(s)\n",
   " 个\n失败: ": "\nFailed: ",
   " 个\n跳过: ": "\nSkipped: ",
   " 个, 失败: ": ", Failed: ",
@@ -524,7 +524,7 @@
   " | ": " | ",
   " | 来源: ": " | Source: ",
   " | 来源: 系统剪贴板": " | Source: System Clipboard",
-  " 个": "",
+  " 个": " file(s)",
   " 个\\n": "\\n",
   " 个\\n失败: ": "\\nFailed: ",
   " 个失败": " failed",
@@ -542,7 +542,7 @@
   "\\n跳过: ": "\\nSkipped: ",
   "具有相同的位置 (": "With same location (",
   "列表已清空\\n": "List cleared\\n",
-  "前": "",
+  "前": " ago",
   "剩余没有位置信息的文件: ": "Remaining files without location: ",
   "剪贴板: ": "Clipboard: ",
   "发现 ": "Found ",
@@ -575,5 +575,8 @@
   " 失败: ": " Failed: ",
   " 跳过: ": " Skipped: ",
   "进度: 0/": "Progress: 0/",
-  " 个文件移至回收站\n": " file(s) to recycle bin\n"
+  " 个文件移至回收站\n": " file(s) to recycle bin\n",
+  "写入结果EXIF结构无效": "Written result has invalid EXIF structure",
+  "重命名失败（目标文件已存在）": "Rename failed (target file already exists)",
+  "正在处理中，请等待当前任务完成": "Processing in progress, please wait for the current task to complete"
 }

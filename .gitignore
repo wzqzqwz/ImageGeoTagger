@@ -34,5 +34,9 @@ exiftool.exe
 # User config
 window_config.json
 
+# WorkBuddy 本地工作数据
+.workbuddy/
+
 # Temp archives
 ImageGeoTagger_v3.1_*.zip
+ImageGeoTagger_v3.1.1_*.zip

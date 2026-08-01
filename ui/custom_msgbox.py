@@ -11,13 +11,15 @@ class _MessageBoxDialog:
 
     def __init__(self, title, message, parent=None, dialog_type='info'):
         self.result = False
+        _temp_root = None
 
         if parent is None or (hasattr(parent, 'winfo_exists') and not parent.winfo_exists()):
             parent = tk._default_root
             if parent is None or (hasattr(parent, 'winfo_exists') and not parent.winfo_exists()):
                 try:
-                    parent = tk.Tk()
-                    parent.withdraw()
+                    _temp_root = tk.Tk()
+                    _temp_root.withdraw()
+                    parent = _temp_root
                 except Exception:
                     import sys
                     print(f"FATAL: {title}: {message}", file=sys.stderr)
@@ -98,6 +100,12 @@ class _MessageBoxDialog:
             pass
         self.window.geometry(f"{w}x{h}+{max(0,x)}+{max(0,y)}")
         self.window.wait_window()
+        # 释放隐式创建的临时根窗口，避免泄漏
+        if _temp_root is not None:
+            try:
+                _temp_root.destroy()
+            except Exception:
+                pass
 
     def _on_yes(self):
         self.result = True
@@ -118,9 +126,19 @@ class _AskStringDialog:
 
     def __init__(self, title, prompt, parent=None, initialvalue=''):
         self.result = None
+        _temp_root = None
 
-        if parent is None:
+        if parent is None or (hasattr(parent, 'winfo_exists') and not parent.winfo_exists()):
             parent = tk._default_root
+            if parent is None or (hasattr(parent, 'winfo_exists') and not parent.winfo_exists()):
+                try:
+                    _temp_root = tk.Tk()
+                    _temp_root.withdraw()
+                    parent = _temp_root
+                except Exception:
+                    import sys
+                    print(f"FATAL: {title}: {prompt}", file=sys.stderr)
+                    return
         self.parent = parent
 
         ww, wh = 360, 170
@@ -163,6 +181,12 @@ class _AskStringDialog:
         self.window.bind('<Escape>', lambda e: self._on_cancel())
 
         self.window.wait_window()
+        # 释放隐式创建的临时根窗口，避免泄漏
+        if _temp_root is not None:
+            try:
+                _temp_root.destroy()
+            except Exception:
+                pass
 
     def _on_ok(self):
         self.result = self.entry_var.get()

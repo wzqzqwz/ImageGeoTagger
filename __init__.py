@@ -1,4 +1,4 @@
-"""Geo Media Tool - 图像及视频地理位置信息处理工具
+"""ImageGeoTagger - 图像及视频地理位置信息处理工具
 
 本工具用于处理图像和视频文件的地理位置信息（GPS）和拍摄日期。
 主要功能包括：
@@ -10,5 +10,5 @@
 """
 
 # 软件版本号和作者信息
-__version__ = "1.0.0"
-__author__ = "Media Tool Team"
+__version__ = "3.1.1"
+__author__ = "wzqzqwz"

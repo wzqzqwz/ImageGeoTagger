@@ -70,7 +70,7 @@ def _windows_recycle(file_paths):
 
     for fp in file_paths:
         if not os.path.exists(fp):
-            failed.append((os.path.basename(fp), _("文件不存在")))
+            failed.append((fp, _("文件不存在")))
             continue
         try:
             path_buf = fp + '\0\0'
@@ -83,9 +83,9 @@ def _windows_recycle(file_paths):
             if result == 0:
                 success_count += 1
             else:
-                failed.append((os.path.basename(fp), _("错误码: ") + str(result)))
+                failed.append((fp, _("错误码: ") + str(result)))
         except Exception as e:
-            failed.append((os.path.basename(fp), str(e)))
+            failed.append((fp, str(e)))
 
     return success_count, failed
 
@@ -99,7 +99,7 @@ def _macos_trash(file_paths):
     failed = []
     for fp in file_paths:
         if not os.path.exists(fp):
-            failed.append((os.path.basename(fp), _("文件不存在")))
+            failed.append((fp, _("文件不存在")))
             continue
         try:
             posix_path = os.path.abspath(fp)
@@ -114,9 +114,9 @@ def _macos_trash(file_paths):
             if result.returncode == 0:
                 success_count += 1
             else:
-                failed.append((os.path.basename(fp), result.stderr.strip() or _("osascript 执行失败")))
+                failed.append((fp, result.stderr.strip() or _("osascript 执行失败")))
         except Exception as e:
-            failed.append((os.path.basename(fp), str(e)))
+            failed.append((fp, str(e)))
     return success_count, failed
 
 
@@ -136,7 +136,7 @@ def _linux_trash(file_paths):
     failed = []
     for fp in file_paths:
         if not os.path.exists(fp):
-            failed.append((os.path.basename(fp), _("文件不存在")))
+            failed.append((fp, _("文件不存在")))
             continue
         try:
             if trash_cmd == 'gio':
@@ -150,13 +150,13 @@ def _linux_trash(file_paths):
                     capture_output=True, text=True, timeout=15, errors='replace'
                 )
             else:
-                failed.append((os.path.basename(fp), _("未找到垃圾箱工具（需要安装 gio 或 trash-put）")))
+                failed.append((fp, _("未找到垃圾箱工具（需要安装 gio 或 trash-put）")))
                 continue
 
             if result.returncode == 0:
                 success_count += 1
             else:
-                failed.append((os.path.basename(fp), result.stderr.strip() or _("执行失败: ") + trash_cmd))
+                failed.append((fp, result.stderr.strip() or _("执行失败: ") + trash_cmd))
         except Exception as e:
-            failed.append((os.path.basename(fp), str(e)))
+            failed.append((fp, str(e)))
     return success_count, failed

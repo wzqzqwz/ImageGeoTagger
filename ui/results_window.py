@@ -402,9 +402,13 @@ class ResultsWindow:
 
         paths = [i.path for i in items if hasattr(i, 'path')]
         success, failed = send_to_recycle_bin(paths)
+        failed_paths = set(f[0] for f in failed) if failed else set()
 
         with self.app.lock:
             for item in items:
+                # 只有删除成功的文件才从列表中移除，失败的文件保留以便重试
+                if getattr(item, 'path', None) in failed_paths:
+                    continue
                 if item in self.app.a:
                     self.app.a.remove(item)
                 if item in self.app.b:
@@ -483,11 +487,15 @@ class ResultsWindow:
                     traceback.print_exc()
         except Exception:
             traceback.print_exc()
+            # 刷新失败时仅关闭窗口，避免递归调用 show_results 导致无限循环
             try:
                 self.window.destroy()
             except Exception:
                 traceback.print_exc()
-            self.geo_tab.show_results()
+            try:
+                self.geo_tab.result_window = None
+            except Exception:
+                pass
 
     def _setup_gpx_tab(self, notebook):
         frame = ttk.Frame(notebook)

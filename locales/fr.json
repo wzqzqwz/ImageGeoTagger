@@ -61,7 +61,7 @@
   " =====\n": " =====\n",
   " GB": " Go",
   " MB": " Mo",
-  " 个\n": "\n",
+  " 个\n": " fichier(s)\n",
   " 个\n失败: ": "\nÉchec: ",
   " 个\n跳过: ": "\nIgnoré: ",
   " 个, 失败: ": ", Échec: ",
@@ -524,7 +524,7 @@
   " | ": " | ",
   " | 来源: ": " | Source: ",
   " | 来源: 系统剪贴板": " | Source: Presse-papiers",
-  " 个": "",
+  " 个": " fichier(s)",
   " 个\\n": "\\n",
   " 个\\n失败: ": "\\nÉchec: ",
   " 个失败": " échec",
@@ -542,7 +542,7 @@
   "\\n跳过: ": "\\nIgnoré: ",
   "具有相同的位置 (": "Avec le même emplacement (",
   "列表已清空\\n": "Liste vidée\\n",
-  "前": "",
+  "前": " auparavant",
   "剩余没有位置信息的文件: ": "Fichiers restants sans localisation: ",
   "剪贴板: ": "Presse-papiers: ",
   "发现 ": "Trouvé ",
@@ -575,5 +575,8 @@
   " 失败: ": " Échec: ",
   " 跳过: ": " Ignoré: ",
   "进度: 0/": "Progression: 0/",
-  " 个文件移至回收站\n": " fichier(s) vers la corbeille\n"
+  " 个文件移至回收站\n": " fichier(s) vers la corbeille\n",
+  "写入结果EXIF结构无效": "Le résultat écrit a une structure EXIF invalide",
+  "重命名失败（目标文件已存在）": "Échec du renommage (le fichier cible existe déjà)",
+  "正在处理中，请等待当前任务完成": "Traitement en cours, veuillez attendre la fin de la tâche actuelle"
 }

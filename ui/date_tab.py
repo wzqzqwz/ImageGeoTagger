@@ -319,9 +319,16 @@ class DateTab:
             path = fi.get('path', '')
             if not path:
                 continue
-            existing = get_existing_datetime(path)
+            # 复用扫描时缓存的 original_date，避免主线程逐文件重读 EXIF 卡顿
+            cached = fi.get('original_date')
+            existing = None
+            if cached:
+                try:
+                    existing = datetime.strptime(cached, '%Y-%m-%d %H:%M:%S')
+                except (ValueError, TypeError):
+                    existing = None
             if mode == "change_date":
-                if existing and existing != datetime.min:
+                if existing is not None and existing != datetime.min:
                     fi['status'] = FileStatus.NO_DATE_NEEDED
                 elif fi.get('new_date') and fi['new_date'] != _('无法解析'):
                     fi['status'] = FileStatus.PENDING_DATE_CHANGE
@@ -330,7 +337,7 @@ class DateTab:
             else:
                 if self.skip_files_with_date.get() and parse_datetime_from_filename(str(path)):
                     fi['status'] = FileStatus.SKIPPED
-                elif not existing or existing == datetime.min:
+                elif existing is None or existing == datetime.min:
                     fi['status'] = FileStatus.SKIPPED
                 else:
                     fi['status'] = FileStatus.PENDING_RENAME
@@ -457,6 +464,9 @@ class DateTab:
             menu.grab_release()
 
     def _remove_items(self, selected_items):
+        if getattr(self, '_processing', False):
+            messagebox.showwarning(_("警告"), _("正在处理中，请等待当前任务完成"))
+            return
         count = len(selected_items)
         if not messagebox.askyesno(_("确认删除"),
                                     _("确定要从处理序列中删除这 ") + str(count) + _(" 个文件吗？")):
@@ -489,6 +499,9 @@ class DateTab:
         self._pulse_progress()
 
     def _delete_items(self, selected_items):
+        if getattr(self, '_processing', False):
+            messagebox.showwarning(_("警告"), _("正在处理中，请等待当前任务完成"))
+            return
         count = len(selected_items)
         if count > 1:
             msg = _("确定要将这 ") + str(count) + _(" 个文件移至回收站吗？")
@@ -504,23 +517,22 @@ class DateTab:
                 paths.append(values[6])
 
         success, failed = send_to_recycle_bin(paths)
-        failed_names = set(f[0] for f in failed) if failed else set()
+        failed_paths = set(f[0] for f in failed) if failed else set()
 
         for item_id in selected_items:
             values = self.date_tree.item(item_id, 'values')
             if values and len(values) >= 7:
                 tree_path = values[6]
-                basename = os.path.basename(tree_path)
-                if basename not in failed_names:
+                if tree_path not in failed_paths:
                     for f in self.files_to_process[:]:
                         fp = str(f.get('path', ''))
                         if fp == tree_path:
                             self.files_to_process.remove(f)
                             break
-            try:
-                self.date_tree.delete(item_id)
-            except Exception:
-                traceback.print_exc()
+                    try:
+                        self.date_tree.delete(item_id)
+                    except Exception:
+                        traceback.print_exc()
 
         self._update_preview()
         self.status_var.set(_("已将 ") + str(success) + _(" 个文件移至回收站"))
@@ -531,6 +543,9 @@ class DateTab:
         self._pulse_progress()
 
     def _rename_single(self, file_info, item_id):
+        if getattr(self, '_processing', False):
+            messagebox.showwarning(_("警告"), _("正在处理中，请等待当前任务完成"))
+            return
         if not file_info:
             return
         current = file_info.get('filename', '')
@@ -562,6 +577,11 @@ class DateTab:
 
         new_path = os.path.join(os.path.dirname(str(file_path)), new_name)
 
+        # 目标文件存在性检查：跨平台防止 os.rename 静默覆盖已有文件
+        if os.path.exists(new_path):
+            messagebox.showerror(_("错误"), _("目标文件已存在: ") + new_name)
+            return
+
         try:
             os.rename(str(file_path), new_path)
         except FileExistsError:
@@ -571,7 +591,6 @@ class DateTab:
             messagebox.showerror(_("错误"), _("重命名失败（可能跨分区），请使用复制后删除的方式"))
             return
         file_info['path'] = new_path
-        file_info['path'] = new_path
         file_info['filename'] = new_name
         file_info['status'] = FileStatus.MANUALLY_RENAMED
         file_info['manual_rename'] = True
@@ -579,6 +598,9 @@ class DateTab:
         self._update_preview()
 
     def _batch_rename_items(self, selected_items, path_to_file):
+        if getattr(self, '_processing', False):
+            messagebox.showwarning(_("警告"), _("正在处理中，请等待当前任务完成"))
+            return
         to_rename = []
         for item_id in selected_items:
             vals = self.date_tree.item(item_id, 'values')
@@ -615,7 +637,8 @@ class DateTab:
             orig_stem, ext = os.path.splitext(new_fn)
             target = os.path.join(base_dir, new_fn)
             counter = 1
-            while target in used_targets and counter < 10000:
+            # 同时检查批内已用目标和磁盘上真实存在的文件，避免覆盖
+            while (target in used_targets or os.path.exists(target)) and counter < 10000:
                 candidate = f"{orig_stem}_{counter:03d}{ext}"
                 target = os.path.join(base_dir, candidate)
                 counter += 1
@@ -625,7 +648,6 @@ class DateTab:
             actual_new_fn = os.path.basename(target)
             try:
                 os.rename(fp, target)
-                fi['path'] = target
                 fi['path'] = target
                 fi['filename'] = actual_new_fn
                 fi['status'] = FileStatus.MANUALLY_RENAMED
@@ -760,7 +782,14 @@ class DateTab:
             new_filename = ''
 
             if self.operation_mode.get() == "rename_file":
-                existing = get_existing_datetime(file_path)
+                # 复用扫描时缓存的 original_date，避免主线程逐文件重读 EXIF 卡顿
+                existing = None
+                cached = fi.get('original_date')
+                if cached:
+                    try:
+                        existing = datetime.strptime(cached, '%Y-%m-%d %H:%M:%S')
+                    except (ValueError, TypeError):
+                        existing = None
                 if st == FileStatus.SKIPPED:
                     if not existing or existing == datetime.min:
                         new_filename = _('无拍摄日期')
@@ -925,9 +954,13 @@ class DateTab:
                 self.date_tree.heading(cid, text=display)
 
     def start_processing(self):
+        if getattr(self, '_processing', False):
+            messagebox.showwarning(_("警告"), _("正在处理中，请等待当前任务完成"))
+            return
         if not self.files_to_process:
             messagebox.showwarning(_("警告"), _("请先扫描文件"))
             return
+        self._processing = True
         dry_run = self.dry_run.get()
         operation_mode = self.operation_mode.get()
         self._export_mode = operation_mode
@@ -999,10 +1032,14 @@ class DateTab:
                 fi['_new_filename_display'] = new_name
                 if not dry_run:
                     new_path = os.path.join(os.path.dirname(fp), new_name)
+                    # 主处理路径同样检查目标存在性，防止覆盖已有文件
+                    if os.path.exists(new_path):
+                        fi['status'] = FileStatus.FAILED
+                        fi['status_detail'] = _("目标文件已存在: ") + new_name
+                        return
                     os.rename(fp, new_path)
                     fi['status'] = FileStatus.RENAMED
                     fi['filename'] = new_name
-                    fi['path'] = new_path
                     fi['path'] = new_path
                 else:
                     fi['status'] = FileStatus.DRY_RUN
@@ -1102,6 +1139,7 @@ class DateTab:
             self.app.root.after(0, lambda: self.status_var.set(_("处理失败")))
         finally:
             self._set_ui_processing_state(False)
+            self.app.root.after(0, lambda: setattr(self, '_processing', False))
 
     def _pulse_progress(self):
         self.progress.config(mode='determinate')
@@ -1118,6 +1156,9 @@ class DateTab:
         self.log_text.config(state='disabled')
 
     def clear_list(self):
+        if getattr(self, '_processing', False):
+            messagebox.showwarning(_("警告"), _("正在处理中，请等待当前任务完成"))
+            return
         self.files_to_process = []
         self._update_preview()
         self.log_text.config(state='normal')
@@ -1126,6 +1167,9 @@ class DateTab:
         self.log_text.config(state='disabled')
 
     def _batch_set_dates_from_filename(self, selected_items, path_to_file):
+        if getattr(self, '_processing', False):
+            messagebox.showwarning(_("警告"), _("正在处理中，请等待当前任务完成"))
+            return
         files_to_process = []
         skipped_no_date = []
         skipped_not_ready = []

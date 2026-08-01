@@ -96,6 +96,19 @@ def _parse_coordinates(content):
         if -90 <= b <= 90 and -180 <= a <= 180:
             return (m.group(2), m.group(1), None)
 
+    # 优先匹配显式的三元组：lat, lon, alt（如 "39.9, 116.4, 50.0"）
+    # 这样高度与经纬度来自同一组数据，避免误取无关数字
+    m3 = re.search(
+        r'(-?\d+\.?\d*)\s*[,，;；\s]\s*(-?\d+\.?\d*)\s*[,，;；\s]\s*(-?\d+\.?\d*)',
+        content)
+    if m3:
+        vals = [float(m3.group(1)), float(m3.group(2)), float(m3.group(3))]
+        # 检查是否符合 (lat, lon, alt) 或 (lon, lat, alt) 组合
+        if -90 <= vals[0] <= 90 and -180 <= vals[1] <= 180:
+            return (m3.group(1), m3.group(2), m3.group(3))
+        if -90 <= vals[1] <= 90 and -180 <= vals[0] <= 180:
+            return (m3.group(2), m3.group(1), m3.group(3))
+
     nums = re.findall(r'-?\d+\.\d+', content)
     if len(nums) >= 2:
         floats = [(s, float(s)) for s in nums]
@@ -109,8 +122,9 @@ def _parse_coordinates(content):
                     continue
                 pair_len = len(lat_str) + len(lon_str)
                 if pair_len > best_len:
-                    alt = nums[2] if len(nums) >= 3 else None
-                    best = (str(lat_val), str(lon_val), alt)
+                    # 高度仅当存在明确的第三个数且与坐标来自同一片段时才有意义，
+                    # 这里不自动猜测高度，避免粘贴错误数据
+                    best = (str(lat_val), str(lon_val), None)
                     best_len = pair_len
         if best:
             return best
@@ -1059,8 +1073,6 @@ class BatchLocationEditDialog:
             ttk.Label(f, text=label, font=('', 11)).pack(side=tk.LEFT, padx=(0, 8))
             entry = ttk.Entry(f, width=18, font=('', 11))
             entry.pack(side=tk.LEFT)
-            if var_name == "alt":
-                entry.insert(0, "0.0")
             setattr(self, f"{var_name}_entry", entry)
 
         paste_f = ttk.Frame(main)
@@ -1226,8 +1238,8 @@ class BatchLocationEditDialog:
                     if ok:
                         with _lock:
                             success += 1
-                        if move_info:
-                            moves.append(move_info)
+                            if move_info:
+                                moves.append(move_info)
                     else:
                         with _lock:
                             failed += 1

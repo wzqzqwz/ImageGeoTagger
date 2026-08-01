@@ -154,16 +154,28 @@ def _local_to_utc_str(dt):
 
     使用 time.mktime 将本地时间转换为 UTC 时间戳，
     自动处理 DST（夏令时）转换。
+
+    注意：time.mktime 在 32 位时间戳环境中只能处理约 1970-2038 年的日期。
+    超出范围的日期（如清空日期后写入的 0001-01-01）会导致 OverflowError，
+    这里捕获异常返回 None，由调用方跳过该时间标签。
     """
     if dt is None:
         return None
-    if dt.tzinfo is not None:
-        utc_dt = dt.astimezone(timezone.utc)
-    else:
-        import time as _time
-        timestamp = _time.mktime(dt.timetuple())
-        utc_dt = datetime.fromtimestamp(timestamp, tz=timezone.utc)
-    return utc_dt.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
+    try:
+        if dt.tzinfo is not None:
+            utc_dt = dt.astimezone(timezone.utc)
+        else:
+            import time as _time
+            # 快速过滤超出 mktime 支持范围的年份，避免不必要的异常开销。
+            # 注意 UTC+x 时区下本地 1970 年初可能对应负时间戳，故下界取 1971。
+            if dt.year < 1971 or dt.year > 2037:
+                return None
+            timestamp = _time.mktime(dt.timetuple())
+            utc_dt = datetime.fromtimestamp(timestamp, tz=timezone.utc)
+        return utc_dt.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
+    except (OverflowError, ValueError, OSError):
+        # mktime 范围限制或系统时区问题，返回 None 由调用方处理
+        return None
 
 
 def create_gpx_element(points, name="Image Geo Data"):
@@ -194,8 +206,18 @@ def create_gpx_element(points, name="Image Geo Data"):
     time_elem.text = _local_to_utc_str(datetime.now())
 
     # 过滤有效数据点并按时间排序
+    # 只保留时间在 mktime 支持范围内的点，避免 OverflowError
+    # 注意：边界要留余量——在 UTC+x 时区，本地 1970-01-01 00:00 可能对应
+    # UTC 1969-12-31（负时间戳），Windows mktime ���支持，故用 1971-2037 保险
+    def _valid_dt(dt_val):
+        return (dt_val is not None
+                and 1971 <= dt_val.year <= 2037)
+
     sorted_items = sorted(
-        [p for p in points if p.get('datetime') and p.get('latitude') is not None and p.get('longitude') is not None],
+        [p for p in points
+         if _valid_dt(p.get('datetime'))
+         and p.get('latitude') is not None
+         and p.get('longitude') is not None],
         key=lambda x: x['datetime']
     )
 
