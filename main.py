@@ -41,7 +41,10 @@ def main():
         try:
             app_dir = get_app_dir()
             icon_ico = os.path.join(app_dir, 'icon.ico')
-            icon_png = os.path.join(app_dir, 'icon.png')
+            # PNG 图标存放在 icons/ 子目录（Windows 图标是 .ico，Linux 等平台使用 .png）
+            icon_png = os.path.join(app_dir, 'icons', 'icon.png')
+            if not os.path.isfile(icon_png):
+                icon_png = os.path.join(app_dir, 'icon.png')
             if platform.system() == "Windows" and os.path.isfile(icon_ico):
                 root.iconbitmap(icon_ico)
             if os.path.isfile(icon_png):

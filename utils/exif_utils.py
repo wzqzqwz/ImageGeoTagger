@@ -14,13 +14,18 @@
 """
 
 import os
+import sys
 import platform
 import struct
 import shutil
 import tempfile
 import subprocess
 import json
+import threading
 import traceback
+import time
+import atexit
+from collections import deque
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
@@ -30,13 +35,256 @@ from PIL.ExifTags import TAGS, GPSTAGS
 import piexif
 from utils.i18n import _
 
-from config import RAW_EXTENSIONS, VIDEO_EXTENSIONS, AUDIO_EXTENSIONS, PIE_SUPPORTED_EXTENSIONS
+from config import RAW_EXTENSIONS, VIDEO_EXTENSIONS, AUDIO_EXTENSIONS
 from utils.platform_utils import get_startupinfo, get_app_dir
+
+# ExifTool 探测结果缓存：避免每个文件都启动一次子进程探测
+_exiftool_cache_lock = threading.Lock()
+_exiftool_cache = {'available': None, 'path': None}
+
+# 并发 ExifTool 子进程信号量：限制同时运行的 exiftool 数量，
+# 防止线程池全开时同时启动数十个 exiftool 进程导致低内存 OOM。
+# 4 并发的写入吞吐过低（每个文件需独立启动 perl 进程），
+# 按 CPU 核数提升并发以加快批量写入。
+EXIFTOOL_MAX_CONCURRENT = max(4, min(12, (os.cpu_count() or 4) * 2))
+
+
+class _PoolExecutionError(Exception):
+    """常驻进程池执行层故障（超时/进程退出等），调用方应回退独立进程模式"""
+
+
+class _StayOpenWorker:
+    """单个 ExifTool 常驻进程（-stay_open 模式）
+
+    通过 stdin 逐条发送命令（每行一个参数，以 -execute 结尾），
+    从 stdout 读到空行判定命令结束，避免每个文件启动一次 perl 进程。
+    同一 worker 串行执行命令，由外部信号量控制整体并发。
+    """
+
+    _ENCODING_HINT = 'FileName encoding must be specified'
+
+    def __init__(self, tool_path, code_page):
+        self.tool_path = tool_path
+        self.code_page = code_page
+        self.lock = threading.Lock()
+        self.dead = False
+        self._stderr_lines = deque()
+        self._start()
+
+    # ---------- 进程生命周期 ----------
+    def _start(self):
+        self.proc = subprocess.Popen(
+            [self.tool_path, '-stay_open', 'True', '-@', '-'],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            bufsize=0, startupinfo=get_startupinfo())
+        self._stderr_thread = threading.Thread(
+            target=self._read_stderr, daemon=True, name='exiftool-stderr')
+        self._stderr_thread.start()
+
+    def _read_stderr(self):
+        enc = f'cp{self.code_page}' if os.name == 'nt' else 'utf-8'
+        try:
+            while True:
+                line = self.proc.stderr.readline()
+                if not line:
+                    break
+                self._stderr_lines.append(line.decode(enc, errors='replace'))
+        except Exception:
+            pass
+
+    def _kill(self):
+        try:
+            self.proc.kill()
+        except Exception:
+            pass
+        try:
+            self.proc.wait(timeout=5)
+        except Exception:
+            pass
+
+    def _restart(self):
+        self._kill()
+        self.dead = False
+        self._stderr_lines.clear()
+        self._start()
+
+    # ---------- 命令执行 ----------
+    def _run_command(self, args, enc, timeout):
+        # 超时看门狗：readline 是阻塞调用，超时只能靠杀进程解除
+        watchdog = threading.Timer(timeout, self._kill)
+        watchdog.daemon = True
+        watchdog.start()
+        try:
+            stderr_start = len(self._stderr_lines)
+            data = ''.join(a + '\n' for a in args) + '-execute\n'
+            self.proc.stdin.write(data.encode(enc, errors='replace'))
+            self.proc.stdin.flush()
+
+            out_parts = []
+            while True:
+                line = self.proc.stdout.readline()
+                if not line:
+                    raise _PoolExecutionError(_("ExifTool 常驻进程意外退出"))
+                text = line.decode(enc, errors='replace')
+                if '{ready}' in text:
+                    break
+                out_parts.append(text)
+            stderr_text = ''.join(
+                list(self._stderr_lines)[stderr_start:]).rstrip('\n')
+            return ''.join(out_parts), stderr_text
+        finally:
+            watchdog.cancel()
+
+    def run(self, args, timeout=60):
+        """执行一条命令，返回 (stdout_text, stderr_text)
+
+        执行层故障（超时/进程退出/编码异常）会重启进程后重试一次，
+        仍失败则抛 _PoolExecutionError 交由调用方回退独立模式。
+        """
+        with self.lock:
+            enc = f'cp{self.code_page}' if os.name == 'nt' else 'utf-8'
+            for attempt in range(2):
+                try:
+                    if self.dead or self.proc.poll() is not None:
+                        self._restart()
+                    return self._run_command(args, enc, timeout)
+                except _PoolExecutionError:
+                    self.dead = True
+                    continue
+                except (BrokenPipeError, OSError, UnicodeError) as e:
+                    self.dead = True
+                    if attempt == 0:
+                        continue
+                    raise _PoolExecutionError(str(e)) from e
+            raise _PoolExecutionError(_("ExifTool 常驻进程连续两次执行失败"))
+
+
+class _ExifToolPool:
+    """ExifTool 常驻进程池
+
+    池内进程通过 -stay_open 常驻，命令经 stdin 交互式发送，
+    省去每文件一次 perl 进程启动的开销。任何执行层故障都会回退
+    到独立进程模式（_run_exiftool 内的原逻辑），保证写入安全性。
+
+    生命周期：任务空闲 EXIFTOOL_POOL_IDLE_SECONDS 后自动关闭
+    （见 close_exiftool_pool），下次使用时由 _get_pool 重新创建，
+    避免任务结束后进程长时间驻留。
+    """
+
+    def __init__(self, size, tool_path):
+        self.size = size
+        self.tool_path = tool_path
+        self.closed = False
+        self._sem = threading.BoundedSemaphore(size)
+        self._lock = threading.Lock()
+        self.workers = [_StayOpenWorker(tool_path, _system_codepage())
+                        for _ in range(size)]
+        self._next = 0
+        atexit.register(self.close)
+
+    def run(self, args, timeout=60):
+        with self._sem:
+            with self._lock:
+                worker = None
+                for _ in range(self.size):
+                    w = self.workers[self._next]
+                    self._next = (self._next + 1) % self.size
+                    if not w.dead:
+                        worker = w
+                        break
+                if worker is None:
+                    raise _PoolExecutionError(_("ExifTool 常驻进程池全部失效"))
+            return worker.run(args, timeout)
+
+    def close(self):
+        self.closed = True
+        for w in getattr(self, 'workers', []):
+            try:
+                w.dead = True
+                w._kill()
+            except Exception:
+                pass
+
+
+_pool_lock = threading.Lock()
+_pool_cache = {}
+_pool_idle_timer = None
+# 最后一次 exiftool 调用后空闲多久自动关闭常驻进程池
+EXIFTOOL_POOL_IDLE_SECONDS = 30
+
+
+def _get_pool(tool_path):
+    """获取常驻进程池；已关闭/不存在的池自动重建，启动失败返回 None"""
+    with _pool_lock:
+        pool = _pool_cache.get(tool_path)
+        if pool is not None and not pool.closed:
+            return pool
+        try:
+            pool = _ExifToolPool(EXIFTOOL_MAX_CONCURRENT, tool_path)
+        except Exception:
+            traceback.print_exc()
+            pool = None
+        _pool_cache[tool_path] = pool
+        return pool
+
+
+def close_exiftool_pool():
+    """关闭 ExifTool 常驻进程池，释放全部 perl 进程
+
+    任务执行完毕后调用；下次任何写入任务开始时 _get_pool 会自动重建。
+    供外部任务收尾调用，也由空闲计时器自动触发。
+    """
+    global _pool_cache, _pool_idle_timer
+    with _pool_lock:
+        if _pool_idle_timer is not None:
+            _pool_idle_timer.cancel()
+            _pool_idle_timer = None
+        for pool in _pool_cache.values():
+            try:
+                pool.close()
+            except Exception:
+                traceback.print_exc()
+        _pool_cache = {}
+
+
+def _arm_pool_idle_close():
+    """每次成功使用池后重置空闲计时器：空闲超过阈值自动关闭池"""
+    global _pool_idle_timer
+    with _pool_lock:
+        if _pool_idle_timer is not None:
+            _pool_idle_timer.cancel()
+        t = threading.Timer(EXIFTOOL_POOL_IDLE_SECONDS, close_exiftool_pool)
+        t.daemon = True
+        _pool_idle_timer = t
+        t.start()
+
+
+# 独立进程模式（常驻池故障回退路径）的信号量：限制并发 exiftool 子进程数
+_exiftool_semaphore = threading.BoundedSemaphore(EXIFTOOL_MAX_CONCURRENT)
+
+
+def _system_codepage():
+    """Windows 活动代码页（中文系统=936/GBK，英文=1252）。
+
+    subprocess 经 CreateProcessW 传参后 ExifTool 侧得到的是系统代码页字节串；
+    常驻池 stdin 通道也必须用该编码写文件名参数。
+    """
+    if os.name == 'nt':
+        try:
+            import ctypes
+            return int(ctypes.windll.kernel32.GetACP())
+        except Exception:
+            pass
+    return 65001
 
 
 def _get_stat(file_path):
     s = os.stat(file_path)
     return s.st_atime, s.st_mtime
+
+
+def _now_str():
+    return datetime.now().strftime('%Y%m%d-%H%M%S')
 
 
 def read_exif_datetime(file_path):
@@ -98,8 +346,15 @@ def read_quicktime_datetime(file_path):
                     if len(header) < ATOM_HEADER_SIZE:
                         break
                     atom_size, atom_type = struct.unpack('>I4s', header)
+                    if atom_size == 1:
+                        # 64 位扩展尺寸（QuickTime 合法值），否则逐字节扫描大文件会卡死
+                        ext = fh.read(8)
+                        if len(ext) < 8:
+                            break
+                        atom_size = struct.unpack('>Q', ext)[0]
                     if atom_size == 0:
-                        break
+                        # 0 表示延伸至文件尾（规范允许），按文件尾处理
+                        atom_size = file_size - pos
                     if atom_type == b'moov':
                         return pos, atom_size
                     pos += atom_size
@@ -127,6 +382,8 @@ def read_quicktime_datetime(file_path):
                     break
                 if sub_type == b'mvhd':
                     # mvhd: 读取版本字节和 creation time
+                    # 布局：8字节atom头 + 1字节版本 + 3字节flags，
+                    # v0: creation_time 4字节（偏移12）；v1: creation_time 8字节（偏移12）
                     read_len = min(sub_size, ATOM_HEADER_SIZE + 28) if sub_size > 0 else ATOM_HEADER_SIZE + 28
                     f.seek(search_pos)
                     mvhd_data = f.read(read_len)
@@ -136,22 +393,59 @@ def read_quicktime_datetime(file_path):
                     if ver == 0:
                         qt_time = struct.unpack('>I', mvhd_data[ATOM_HEADER_SIZE + 4:ATOM_HEADER_SIZE + 8])[0]
                     else:
-                        if len(mvhd_data) < ATOM_HEADER_SIZE + 28:
+                        if len(mvhd_data) < ATOM_HEADER_SIZE + 12:
                             break
-                        qt_time = struct.unpack('>Q', mvhd_data[ATOM_HEADER_SIZE + 12:ATOM_HEADER_SIZE + 20])[0]
+                        qt_time = struct.unpack('>Q', mvhd_data[ATOM_HEADER_SIZE + 4:ATOM_HEADER_SIZE + 12])[0]
                     utc_dt = (datetime(1904, 1, 1) + timedelta(seconds=qt_time)).replace(tzinfo=timezone.utc)
                     return utc_dt.astimezone().replace(tzinfo=None)
                 search_pos += sub_size
-    except (OSError, ValueError, KeyError, struct.error, MemoryError) as e:
+    except (OSError, ValueError, KeyError, struct.error, MemoryError, OverflowError) as e:
         traceback.print_exc()
     return None
+
+
+def _exif_ratio_value(v):
+    """将 exifread 的 Ratio/数值安全转换为 float（0 分母/异常返回 None）"""
+    try:
+        if hasattr(v, 'num'):
+            den = float(getattr(v, 'den', 1))
+            if den == 0:
+                return None
+            return float(v.num) / den
+        return float(v)
+    except (AttributeError, ValueError, TypeError, ZeroDivisionError):
+        return None
+
+
+def _ratio_deg_to_float(values):
+    """将度/分/秒三元组安全转换为十进制度数，失败返回 None"""
+    try:
+        if len(values) != 3:
+            return None
+        parts = [_exif_ratio_value(v) for v in values]
+        if any(p is None for p in parts):
+            return None
+        return parts[0] + parts[1] / 60 + parts[2] / 3600
+    except Exception:
+        return None
 
 
 def to_degrees(value):
     """将十进制度数转换为 (度, 分, 秒) 格式（带进位处理）
 
     EXIF 标准使用度/分/秒的分数形式存储 GPS 坐标。
-    例如：116.39747° 转换为 ((116,1), (23,1), (5099,100))
+    例如：116.39747° 转换为 ((116,1), (23,1), (1430892,1e6))
+
+    采用整数运算（秒分辨率 1/1e6 ≈ 2.8e-10 度 ≈ 0.003 厘米）：
+      - 避免浮点乘除产生长尾小数（如 0.0399999999999992）
+      - 与 ExifTool 写入路径（RAW/视频/音频）精度一致，
+        保证粘贴的坐标写入不同文件后数值位数不丢失
+      - 分母固定 1e6 且 3600 含因子 9：输入为 6 位小数（手机照片
+        标准）时组合值整除 9，约分后分母仅含 2/5 因子，Windows
+        资源管理器属性栏等十进制回读显示为有限小数，无 0.5887888889
+        类长尾
+    分子上限 < 60 * DEN = 6e7，低于 EXIF Rational 的 32 位上限
+    （4.29e9），可被 piexif 正常序列化。
 
     Args:
         value: 十进制度数值
@@ -159,17 +453,11 @@ def to_degrees(value):
     Returns:
         tuple: ((度, 分母), (分, 分母), (秒, 分母))
     """
-    d = int(value)
-    rest = (value - d) * 60
-    m = int(rest)
-    s = round((rest - m) * 60 * 100)
-    if s >= 6000:
-        m += s // 6000
-        s = s % 6000
-    if m >= 60:
-        d += m // 60
-        m = m % 60
-    return ((d, 1), (m, 1), (s, 100))
+    DEN = 1_000_000  # 秒的表示精度：1/1e6 秒 ≈ 2.8e-10 度
+    total = round(value * 3600 * DEN)  # 总"单位秒"，整数
+    d, rem = divmod(total, 3600 * DEN)
+    m, s = divmod(rem, 60 * DEN)
+    return ((d, 1), (m, 1), (s, DEN))
 
 
 def parse_video_time(time_str):
@@ -197,6 +485,23 @@ def parse_video_time(time_str):
         if time_str.endswith('Z') or 'UTC' in time_str.upper():
             is_utc = True
             time_str = time_str.replace('Z', '').replace('UTC', '').strip()
+
+        # 显式时区偏移（ExifTool 常输出 ...+08:00 / ...-05:00）：
+        # 用带 %z 的格式解析，再转成本地时间，保证与照片/GPX 的
+        # 本地 naive 时间在同一时间线上比较。
+        offset_formats = [
+            "%Y:%m:%d %H:%M:%S%z",
+            "%Y-%m-%d %H:%M:%S%z",
+            "%Y/%m/%d %H:%M:%S%z",
+            "%Y-%m-%dT%H:%M:%S%z",
+            "%Y-%m-%dT%H:%M:%S.%f%z",
+        ]
+        for fmt in offset_formats:
+            try:
+                aware = datetime.strptime(time_str.strip(), fmt)
+                return aware.astimezone().replace(tzinfo=None)
+            except ValueError:
+                continue
 
         for fmt in common_formats:
             try:
@@ -282,6 +587,14 @@ def check_exiftool():
     return False, None
 
 
+def get_exiftool_cached():
+    """获取 ExifTool 路径（带缓存，避免每个文件重复探测子进程）"""
+    with _exiftool_cache_lock:
+        if _exiftool_cache['available'] is None:
+            _exiftool_cache['available'], _exiftool_cache['path'] = check_exiftool()
+        return _exiftool_cache['available'], _exiftool_cache['path']
+
+
 def _build_gps_exiftool_args(location_info):
     args = [
         f'-GPSLatitude={location_info["latitude"]}',
@@ -294,17 +607,11 @@ def _build_gps_exiftool_args(location_info):
             f'-GPSAltitude={abs(location_info["altitude"])}',
             f'-GPSAltitudeRef={"0" if location_info["altitude"] >= 0 else "1"}'
         ]
+    else:
+        # 高度为空 = 清除文件中原有的 GPS 高度标签，
+        # 与 piexif 路径（整块替换 GPS IFD）行为保持一致
+        args += ['-GPSAltitude=', '-GPSAltitudeRef=']
     return args
-
-def _try_write_with_methods(file_path, methods):
-    for method in methods:
-        try:
-            _run_exiftool(method, file_path)
-            return True
-        except Exception:
-            traceback.print_exc()
-            continue
-    return False
 
 
 def update_image_gps(file_path, location_info):
@@ -341,6 +648,7 @@ def update_image_gps(file_path, location_info):
             if abs(abs_alt - round(abs_alt)) < 1e-9:
                 gps_ifd[piexif.GPSIFD.GPSAltitude] = (round(abs_alt), 1)
             else:
+                # 厘米级精度（分母 100 = 0.01 米），避免截断原始数值位数
                 numerator = round(abs_alt * 100)
                 gps_ifd[piexif.GPSIFD.GPSAltitude] = (numerator, 100)
 
@@ -365,62 +673,186 @@ def update_image_gps(file_path, location_info):
                 pass
 
 
-def _run_exiftool(args, file_path):
+def _run_exiftool(args, file_path, strict=False):
     """运行 ExifTool 命令行工具
 
     使用固定的参数组合：
       -overwrite_original: 直接覆盖原文件（不创建备份）
       -P: 保留原始文件时间戳
 
+    执行路径：优先使用常驻进程池（-stay_open，省去每文件 perl 进程启动），
+    池执行层故障时自动回退到独立进程模式；两条路径的写入安全性一致。
+
+    写前备份：覆盖写入前先把原文件完整复制到同目录（同盘，速度快，
+    目录不可写时回退系统临时目录），写入成功后删除备份，任何异常路径
+    （ExifTool 失败/被中断/严格校验不通过）都会自动用备份恢复原文件。
+
     Args:
         args: ExifTool 参数列表
         file_path: 要处理的文件路径
-
-    Returns:
-        subprocess.CompletedProcess
+        strict: 为 True 时，ExifTool 输出含警告
+                （如"标签不支持"）也视为失败，避免误报写入成功
 
     Raises:
         Exception: ExifTool 不可用或运行失败
     """
-    available, tool_path = check_exiftool()
+    available, tool_path = get_exiftool_cached()
     if not available:
         raise Exception(_("ExifTool 不可用，无法处理此文件"))
 
-    cmd = [tool_path, '-overwrite_original', '-P', *args, file_path]
-    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                            text=True, timeout=60, startupinfo=get_startupinfo(),
-                            errors='replace')
-    if result.returncode != 0:
-        msg = result.stderr or result.stdout or ""
-        ext = os.path.splitext(file_path)[1].lower()
-        if "not yet supported" in msg:
+    # ---- 写前备份：保证失败时能恢复原始文件 ----
+    backup_path = _make_backup(file_path) if os.path.isfile(file_path) else None
+
+    # 清理上次异常退出残留的 ExifTool 临时文件（<name>_exiftool_tmp）。
+    # ExifTool 使用 -overwrite_original 写盘时若检测到同名 tmp 已存在会拒绝写入
+    # 并报 "Temporary file already exists"；程序内同一文件写入是串行的，
+    # 残留只能来自被强杀/崩溃的旧进程，删除后可继续正常写入。
+    if os.path.isfile(file_path):
+        try:
+            stale_tmp = file_path + '_exiftool_tmp'
+            if os.path.exists(stale_tmp):
+                os.remove(stale_tmp)
+        except OSError:
+            pass
+
+    restore_ok = False
+    try:
+        stdout_text, stderr_text = _execute_exiftool(tool_path, args, file_path)
+        _validate_exiftool_result(stdout_text, stderr_text, strict, file_path, tool_path, args)
+        restore_ok = True  # 写入成功，稍后清理备份
+    except Exception:
+        # 任何失败路径：用备份恢复原文件，然后重新抛出
+        restore_ok = False
+        if backup_path and os.path.exists(backup_path):
+            try:
+                shutil.copy2(backup_path, file_path)
+                restore_ok = True
+            except Exception:
+                traceback.print_exc()
+        # 恢复失败时绝不删除备份：备份是此时唯一的原始副本，删了会永久丢失数据。
+        # 将其复制为 原文件名.igt_backup_<时间戳> 保留在原文件同目录，
+        # 并在异常信息中附上备份路径，便于用户手动找回。
+        if backup_path and os.path.exists(backup_path) and not restore_ok:
+            keep_name = file_path + '.igt_backup_' + _now_str()
+            try:
+                shutil.copy2(backup_path, keep_name)
+                raise Exception(
+                    _("写入失败且原文件恢复失败，已保留备份: ") + keep_name)
+            except Exception:
+                traceback.print_exc()
+                raise
+        raise
+    finally:
+        # 仅在成功或备份已被原样恢复时才删除备份；
+        # 恢复失败时备份已复制为 .igt_backup_*，此处不应再删。
+        if backup_path and os.path.exists(backup_path) and restore_ok:
+            try:
+                os.remove(backup_path)
+            except OSError:
+                pass
+
+
+def _make_backup(file_path):
+    """写前备份：优先原文件同目录（同盘复制快），目录不可写时回退系统临时目录"""
+    ext = os.path.splitext(file_path)[1] or '.bin'
+    base_dir = os.path.dirname(os.path.abspath(file_path))
+    tried = []
+    for d in (base_dir, None):  # None = 系统临时目录
+        backup_path = None
+        try:
+            fd, backup_path = tempfile.mkstemp(prefix='.igt_bak_', suffix=ext, dir=d)
+            os.close(fd)
+            shutil.copy2(file_path, backup_path)
+            return backup_path
+        except Exception:
+            if backup_path:
+                try:
+                    os.remove(backup_path)
+                except OSError:
+                    pass
+            tried.append(str(d or _("系统临时目录")))
+            continue
+    # 备份失败（如磁盘满/权限）时中止写入，避免无备份覆盖原文件
+    raise Exception(_("无法创建原文件备份，已中止写入: ") + str(file_path))
+
+
+def _execute_exiftool(tool_path, args, file_path):
+    """执行 ExifTool 写入命令，返回 (stdout_text, stderr_text)
+
+    优先常驻进程池；池执行层故障（进程超时/退出等）时回退到独立进程模式。
+    """
+    cmd_args = ['-overwrite_original', '-P', *args, file_path]
+
+    def run_independent():
+        with _exiftool_semaphore:
+            r = subprocess.run([tool_path, *cmd_args],
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               text=True, timeout=60, startupinfo=get_startupinfo(),
+                               errors='replace')
+            return r.stdout, r.stderr
+
+    pool = None
+    try:
+        pool = _get_pool(tool_path)
+    except Exception:
+        traceback.print_exc()
+    if pool is not None:
+        try:
+            result = pool.run(cmd_args)
+            # 每次成功使用后重置空闲计时器，任务结束自动回收进程
+            _arm_pool_idle_close()
+            return result
+        except _PoolExecutionError:
+            pass  # 池故障，回退独立模式
+    return run_independent()
+
+
+def _validate_exiftool_result(stdout_text, stderr_text, strict, file_path, tool_path, args):
+    """基于输出文本校验 ExifTool 写入结果
+
+    常驻池模式没有进程级返回码，用输出文本等价判断：
+    "Error" 出现在 stderr 视同原逻辑的 returncode != 0。
+
+    Raises:
+        Exception: 写入失败（含严格模式下的警告）
+    """
+    stderr = stderr_text or ""
+    msg = stderr.strip() or (stdout_text or "").strip()
+
+    if "Error" in stderr or "not yet supported" in stderr:
+        if "FileName encoding must be specified" in stderr:
+            # 老版本 ExifTool 未指定文件名编码时直接失败：用系统代码页编码重试
+            out2, err2 = _execute_exiftool(
+                tool_path, ['-charset', 'filename=cp' + str(_system_codepage())] + list(args), file_path)
+            if ("Error" in (err2 or "") or "not yet supported" in (err2 or "")) \
+                    or "FileName encoding must be specified" in (err2 or ""):
+                raise Exception(_("文件名包含非ASCII字符，处理失败"))
+            return
+        if "not yet supported" in stderr:
+            ext = os.path.splitext(file_path)[1].lower()
             raise Exception(_("暂不支持写入") + f" {ext.upper()} " + _("文件格式"))
-        elif "FileName encoding must be specified" in msg:
-            # 重试时加上 UTF-8 文件名编码参数
-            retry_cmd = [tool_path, '-overwrite_original', '-P',
-                         '-charset', 'Filename=UTF8', *args, file_path]
-            result = subprocess.run(retry_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                    text=True, timeout=60, startupinfo=get_startupinfo(),
-                                    errors='replace')
-            if result.returncode == 0:
-                return result
-            raise Exception(_("文件名包含非ASCII字符，处理失败"))
-        else:
-            raise Exception(msg)
-    return result
+        raise Exception(msg[:500])
+    if strict and stderr and ('Warning' in stderr or 'Error' in stderr):
+        if "FileName encoding must be specified" not in stderr:
+            # ExifTool 对不支持的标签仅打 warning 且 exit 0，实际并未写入。
+            # 但 "not defined" 类警告（如向 QuickTime 写无组前缀的 GPSAltitude）
+            # 只代表该标签不被容器支持，其它标签（lat/lon）已成功写入，
+            # 此时不应把整个方法判定失败回滚。
+            if "not defined" not in stderr:
+                raise Exception(_("ExifTool 未成功写入: ") + stderr.strip()[:200])
 
 
 def _write_gps_with_exiftool(file_path, location_info, orig_atime, orig_mtime):
     """使用 ExifTool 写入 GPS 坐标的内部函数（piexif 失败时的后备方案）"""
     gpscmd = _build_gps_exiftool_args(location_info)
-    _run_exiftool(gpscmd, file_path)
+    _run_exiftool(gpscmd, file_path, strict=True)
     os.utime(file_path, (orig_atime, orig_mtime))
 
 
 def update_raw_gps(file_path, location_info):
     orig_atime, orig_mtime = _get_stat(file_path)
     gpscmd = _build_gps_exiftool_args(location_info)
-    _run_exiftool(gpscmd, file_path)
+    _run_exiftool(gpscmd, file_path, strict=True)
     os.utime(file_path, (orig_atime, orig_mtime))
 
 
@@ -437,7 +869,9 @@ def update_video_gps(file_path, location_info):
     orig_atime, orig_mtime = _get_stat(file_path)
     ext = os.path.splitext(file_path)[1].lower()
 
-    # 尝试五种不同的写入方法，支持不同视频格式的元数据容器
+    # 尝试五种不同的写入方法，支持不同视频格式的元数据容器。
+    # 只有 lat/lon 参与容器探测；高度单独用 XMP 组补写（见下），
+    # 因为 Keys/QuickTime/UserData 组大多不支持 GPSAltitude。
     methods = [
         [f'-Keys:GPSCoordinates={location_info["latitude"]},{location_info["longitude"]}',
          f'-Keys:GPSLatitude={location_info["latitude"]}',
@@ -458,20 +892,29 @@ def update_video_gps(file_path, location_info):
          f'-GPSLongitudeRef={"E" if location_info["longitude"] >= 0 else "W"}']
     ]
 
-    if location_info.get('altitude') is not None:
-        for method in methods:
-            method.append(f'-GPSAltitude={abs(location_info["altitude"])}')
-            method.append(f'-GPSAltitudeRef={"0" if location_info["altitude"] >= 0 else "1"}')
-
     success = False
     for method in methods:
         try:
-            _run_exiftool(method, file_path)
+            _run_exiftool(method, file_path, strict=True)
             success = True
             break
         except Exception:
             traceback.print_exc()
             continue
+
+    # 高度独立补写：只有 XMP 组（及标准 GPS 组）支持 GPSAltitude，
+    # 覆盖 Keys/QuickTime/UserData 容器。高度写入失败不回滚已成功的 lat/lon。
+    if success and location_info.get('altitude') is not None:
+        try:
+            alt_method = [
+                f'-XMP:GPSAltitude={abs(location_info["altitude"])}',
+                f'-XMP:GPSAltitudeRef={"0" if location_info["altitude"] >= 0 else "1"}',
+                f'-GPSAltitude={abs(location_info["altitude"])}',
+                f'-GPSAltitudeRef={"0" if location_info["altitude"] >= 0 else "1"}',
+            ]
+            _run_exiftool(alt_method, file_path, strict=True)
+        except Exception:
+            traceback.print_exc()
 
     if success:
         os.utime(file_path, (orig_atime, orig_mtime))
@@ -499,25 +942,32 @@ def update_audio_gps(file_path, location_info):
          f'-GPSLatitudeRef={"N" if location_info["latitude"] >= 0 else "S"}',
          f'-GPSLongitudeRef={"E" if location_info["longitude"] >= 0 else "W"}']
     ]
-    if location_info.get('altitude') is not None:
-        for method in methods:
-            method += [f'-GPSAltitude={abs(location_info["altitude"])}',
-                       f'-GPSAltitudeRef={"0" if location_info["altitude"] >= 0 else "1"}']
 
     success = False
     for method in methods:
         try:
-            _run_exiftool(method, file_path)
+            _run_exiftool(method, file_path, strict=True)
             success = True
             break
         except Exception:
             traceback.print_exc()
             continue
 
+# 高度独立补写（音频同视频：XMP 组支持 GPSAltitude）
+    if success and location_info.get('altitude') is not None:
+        try:
+            _run_exiftool([
+                f'-XMP:GPSAltitude={abs(location_info["altitude"])}',
+                f'-XMP:GPSAltitudeRef={"0" if location_info["altitude"] >= 0 else "1"}',
+            ], file_path, strict=True)
+        except Exception:
+            traceback.print_exc()
+
     if success:
         os.utime(file_path, (orig_atime, orig_mtime))
     else:
         raise Exception(_("所有GPS写入方法均失败，不支持的音频文件格式"))
+
 
 
 def remove_gps_info(file_path):
@@ -604,7 +1054,7 @@ def _write_date_with_exiftool(file_path, new_datetime, orig_atime, orig_mtime):
     args = [f'-DateTimeOriginal={date_str}',
             f'-DateTime={date_str}',
             f'-DateTimeDigitized={date_str}']
-    _run_exiftool(args, file_path)
+    _run_exiftool(args, file_path, strict=True)
     os.utime(file_path, (orig_atime, orig_mtime))
 
 
@@ -613,7 +1063,7 @@ def update_raw_date(file_path, new_datetime):
     orig_atime, orig_mtime = _get_stat(file_path)
     d = new_datetime.strftime("%Y:%m:%d %H:%M:%S")
     args = [f'-DateTimeOriginal={d}', f'-DateTime={d}', f'-CreateDate={d}']
-    _run_exiftool(args, file_path)
+    _run_exiftool(args, file_path, strict=True)
     os.utime(file_path, (orig_atime, orig_mtime))
 
 
@@ -633,7 +1083,7 @@ def update_video_date(file_path, new_datetime):
     success = False
     for method in methods:
         try:
-            _run_exiftool(method, file_path)
+            _run_exiftool(method, file_path, strict=True)
             success = True
             break
         except Exception:
@@ -661,7 +1111,7 @@ def update_audio_date(file_path, new_datetime):
     success = False
     for method in methods:
         try:
-            _run_exiftool(method, file_path)
+            _run_exiftool(method, file_path, strict=True)
             success = True
             break
         except Exception:
@@ -719,12 +1169,11 @@ def extract_exif_gps(file_path):
 
         lat = lon = alt = None
         if 'GPS GPSLatitude' in tags and 'GPS GPSLongitude' in tags:
-            latv, lonv = tags['GPS GPSLatitude'].values, tags['GPS GPSLongitude'].values
-            lat = float(latv[0]) + float(latv[1]) / 60 + float(latv[2]) / 3600
-            lon = float(lonv[0]) + float(lonv[1]) / 60 + float(lonv[2]) / 3600
-            if 'GPS GPSLatitudeRef' in tags and str(tags['GPS GPSLatitudeRef']) == 'S':
+            lat = _ratio_deg_to_float(tags['GPS GPSLatitude'].values)
+            lon = _ratio_deg_to_float(tags['GPS GPSLongitude'].values)
+            if lat is not None and 'GPS GPSLatitudeRef' in tags and str(tags['GPS GPSLatitudeRef']) == 'S':
                 lat = -lat
-            if 'GPS GPSLongitudeRef' in tags and str(tags['GPS GPSLongitudeRef']) == 'W':
+            if lon is not None and 'GPS GPSLongitudeRef' in tags and str(tags['GPS GPSLongitudeRef']) == 'W':
                 lon = -lon
 
         if 'GPS GPSAltitude' in tags:
@@ -733,15 +1182,17 @@ def extract_exif_gps(file_path):
                 v = vals[0] if vals else None
                 if v is not None:
                     if hasattr(v, "num"):
+                        # exifread 的 Ratio 继承 Fraction，0/0 时 num/den 均为 0，
+                        # float(v) 会抛 ZeroDivisionError，必须显式防护
                         den = float(getattr(v, 'den', 1))
-                        alt = float(v.num) / den if den != 0 else float(v)
+                        alt = float(v.num) / den if den != 0 else None
                     else:
                         alt = float(v)
-                    if 'GPS GPSAltitudeRef' in tags:
+                    if alt is not None and 'GPS GPSAltitudeRef' in tags:
                         refs = tags['GPS GPSAltitudeRef'].values
                         if refs and refs[0] == 1:
                             alt = -alt
-            except (AttributeError, IndexError, ValueError):
+            except (AttributeError, IndexError, ValueError, ZeroDivisionError, TypeError):
                 alt = None
 
         return lat, lon, alt
@@ -771,7 +1222,12 @@ def extract_pil_gps(file_path):
                 tname = TAGS.get(tag, tag)
                 if tname == 'GPSInfo':
                     gps_data = {}
-                    for gt, gv in val.items():
+                    try:
+                        items = val.items()
+                    except AttributeError:
+                        # 某些文件的 GPSInfo 值不是可迭代字典（如 int），跳过
+                        items = []
+                    for gt, gv in items:
                         gps_data[GPSTAGS.get(gt, gt)] = gv
                     lat = lon = alt = None
                     if 'GPSLatitude' in gps_data and 'GPSLongitude' in gps_data:
@@ -784,11 +1240,15 @@ def extract_pil_gps(file_path):
                             lon = -lon
                     if 'GPSAltitude' in gps_data:
                         v = gps_data['GPSAltitude']
-                        alt = float(v[0]) / float(v[1]) if isinstance(v, tuple) and len(v) >= 2 and float(v[1]) != 0 else float(v)
-                        if gps_data.get('GPSAltitudeRef', 0) == 1:
+                        if isinstance(v, tuple) and len(v) >= 2:
+                            den = float(v[1])
+                            alt = float(v[0]) / den if den != 0 else None
+                        else:
+                            alt = float(v)
+                        if alt is not None and gps_data.get('GPSAltitudeRef', 0) == 1:
                             alt = -alt
                     return lat, lon, alt
-    except (OSError, ValueError, KeyError, struct.error):
+    except (OSError, ValueError, KeyError, struct.error, ZeroDivisionError, TypeError):
         traceback.print_exc()
     return None, None, None
 
@@ -805,7 +1265,7 @@ def extract_video_gps_with_exiftool(file_path):
     Returns:
         tuple: (纬度, 经度, 高度, 时间)，失败返回 (None, None, None, None)
     """
-    available, tool_path = check_exiftool()
+    available, tool_path = get_exiftool_cached()
     if not available:
         return None, None, None, None
 
@@ -813,9 +1273,10 @@ def extract_video_gps_with_exiftool(file_path):
     cmd = [tool, '-j', '-G', '-n', file_path]
 
     try:
-        r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                          text=True, timeout=30, startupinfo=get_startupinfo(),
-                          errors='replace')
+        with _exiftool_semaphore:
+            r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              text=True, timeout=30, startupinfo=get_startupinfo(),
+                              errors='replace')
         if r.returncode != 0:
             return None, None, None, None
 

@@ -11,6 +11,89 @@ import traceback
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone, timedelta
 
+try:
+    from defusedxml import ElementTree as SafeET
+except ImportError:
+    SafeET = None
+
+
+def _reject_unsafe_xml(gpx_file_path):
+    """流式扫描 XML 前导部分，检测 DTD/实体声明（防实体膨胀 DoS）。
+
+    恶意 GPX 可通过内部实体展开（billion laughs）造成内存耗尽。
+    DTD 声明只能出现在根元素之前的 prolog 中；与固定读取文件头部不同，
+    这里按 XML 词法逐段扫描（跳过注释和处理指令），直到遇到根元素才停止，
+    因此声明前即使有大量前导空白/注释也能被检测到。
+
+    Returns:
+        bool: True 表示检测到 DTD/实体声明或前导异常，应拒绝解析
+    """
+    # 单个注释/空白段超过该长度视为异常前导，保守拒绝
+    MAX_SCAN = 4 * 1024 * 1024
+    try:
+        with open(gpx_file_path, 'rb') as f:
+            buf = b''
+            pos = 0
+            while True:
+                lt = buf.find(b'<', pos)
+                if lt == -1:
+                    # 当前位置之后没有 '<'：继续读取更多数据
+                    if len(buf) - pos > MAX_SCAN:
+                        return True
+                    chunk = f.read(65536)
+                    if not chunk:
+                        # EOF，整个文件都是前导部分，未发现危险声明
+                        return False
+                    buf += chunk
+                    continue
+                if lt - pos > MAX_SCAN:
+                    # 元素间超长空白/文本，异常
+                    return True
+                if buf.startswith(b'<!--', lt):
+                    # 注释：内部内容不会展开，跳过
+                    end = buf.find(b'-->', lt + 4)
+                    if end == -1 or end - lt > MAX_SCAN:
+                        if end != -1:
+                            return True
+                        # 未找到终止符：累计长度超限即拒绝（防内存无界增长）
+                        if len(buf) - lt > MAX_SCAN:
+                            return True
+                        chunk = f.read(65536)
+                        if not chunk:
+                            return False
+                        buf += chunk
+                        continue
+                    pos = end + 3
+                    continue
+                if buf.startswith(b'<?', lt):
+                    # 处理指令（如 XML 声明）：跳过
+                    end = buf.find(b'?>', lt + 2)
+                    if end == -1:
+                        if len(buf) - lt > MAX_SCAN:
+                            return True
+                        chunk = f.read(65536)
+                        if not chunk:
+                            return False
+                        buf += chunk
+                        continue
+                    pos = end + 2
+                    continue
+                if len(buf) - lt < 9:
+                    # 声明/标签可能被截断在缓冲区边界，补齐后再判断
+                    chunk = f.read(65536)
+                    if not chunk:
+                        return False
+                    buf += chunk
+                    continue
+                low = buf[lt:lt + 9].lower()
+                if low.startswith(b'<!doctype') or low.startswith(b'<!entity'):
+                    return True
+                # 根元素（或其它非 DTD 声明）出现，前导扫描结束
+                return False
+    except Exception:
+        return False
+    return False
+
 
 def parse_gpx_time(time_str):
     """解析 GPX 时间字符串（将 UTC 转换为本地时间）
@@ -69,7 +152,14 @@ def parse_gpx_file(gpx_file_path):
     """
     points = []
     try:
-        tree = ET.parse(gpx_file_path)
+        # 拒绝含 DTD/实体声明的 GPX，防止实体膨胀 DoS
+        if _reject_unsafe_xml(gpx_file_path):
+            return points
+
+        if SafeET is not None:
+            tree = SafeET.parse(gpx_file_path)
+        else:
+            tree = ET.parse(gpx_file_path)
         root = tree.getroot()
 
         # 自动检测并处理 XML 命名空间
@@ -107,11 +197,24 @@ def parse_gpx_file(gpx_file_path):
             if dt is None:
                 continue
 
+            # 单个坏点（非法/越界坐标）只跳过该点，不影响同文件其它有效点
+            try:
+                lat_v = float(lat)
+                lon_v = float(lon)
+                ele_v = float(ele) if ele is not None else None
+            except (ValueError, TypeError):
+                continue
+            if not -90 <= lat_v <= 90 or not -180 <= lon_v <= 180:
+                continue
+            if ele_v is not None and not (ele_v == ele_v):
+                # NaN 高度视为无高度
+                ele_v = None
+
             points.append({
                 'datetime': dt,
-                'latitude': float(lat),
-                'longitude': float(lon),
-                'altitude': float(ele) if ele is not None else None,
+                'latitude': lat_v,
+                'longitude': lon_v,
+                'altitude': ele_v,
                 'source': 'GPX',
                 'source_file': os.path.basename(gpx_file_path),
             })
@@ -208,7 +311,7 @@ def create_gpx_element(points, name="Image Geo Data"):
     # 过滤有效数据点并按时间排序
     # 只保留时间在 mktime 支持范围内的点，避免 OverflowError
     # 注意：边界要留余量——在 UTC+x 时区，本地 1970-01-01 00:00 可能对应
-    # UTC 1969-12-31（负时间戳），Windows mktime ���支持，故用 1971-2037 保险
+    # UTC 1969-12-31（负时间戳），Windows mktime 不支持，故用 1971-2037 保险
     def _valid_dt(dt_val):
         return (dt_val is not None
                 and 1971 <= dt_val.year <= 2037)
@@ -230,22 +333,23 @@ def create_gpx_element(points, name="Image Geo Data"):
 
         for item in sorted_items:
             trkpt = ET.SubElement(trkseg, "trkpt")
-            trkpt.set("lat", str(item['latitude']))
-            trkpt.set("lon", str(item['longitude']))
+            # 6 位小数与手机照片 EXIF 精度一致（1e-6 度 ≈ 11 厘米）
+            trkpt.set("lat", f"{item['latitude']:.8f}")
+            trkpt.set("lon", f"{item['longitude']:.8f}")
             if item.get('altitude') is not None:
                 ele = ET.SubElement(trkpt, "ele")
-                ele.text = str(item['altitude'])
+                ele.text = f"{item['altitude']:.2f}"
             t = ET.SubElement(trkpt, "time")
             t.text = _local_to_utc_str(item['datetime'])
 
     # 生成航点（wpt），包含文件名
     for item in sorted_items:
         wpt = ET.SubElement(root, "wpt")
-        wpt.set("lat", str(item['latitude']))
-        wpt.set("lon", str(item['longitude']))
+        wpt.set("lat", f"{item['latitude']:.8f}")
+        wpt.set("lon", f"{item['longitude']:.8f}")
         if item.get('altitude') is not None:
             ele = ET.SubElement(wpt, "ele")
-            ele.text = str(item['altitude'])
+            ele.text = f"{item['altitude']:.2f}"
         n = ET.SubElement(wpt, "name")
         n.text = item.get('filename', "Point")
         if item.get('datetime'):

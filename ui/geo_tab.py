@@ -40,6 +40,8 @@ class GeoTab:
         self.exiftool_available = None
         self.exiftool_path = None
         self.result_window = None
+        # 上次有效的时间差阈值缓存（首次非法输入时用于还原）
+        self._threshold_min_cache = 30
 
         self.create_interface()
 
@@ -210,21 +212,26 @@ class GeoTab:
                 self.geo_selected_directory.set(p)
                 return
 
-    def _on_folder_path_changed(self, *_):
+    def _on_folder_path_changed(self, *_args):
         if self.geo_selected_directory.get():
             self.status_var.set(_("提取图像信息"))
         else:
             self.status_var.set(_("就绪：请选择文件夹"))
 
-    def update_ui_state(self, processing):
-        with self.app.lock:
-            self.app.is_processing = processing
+    def update_ui_state(self, processing, thread=None):
         state = "disabled" if processing else "normal"
         self.extract_btn.config(state=state)
         self.process_btn.config(state=state)
-        if not processing:
-            with self.app.lock:
+        self._btn_show.config(state=state)
+        self._btn_export.config(state=state)
+        if processing:
+            return
+        # 只清除"自己"的线程状态，避免旧线程的结束回调误清新线程状态
+        with self.app.lock:
+            if thread is None or self.app.current_thread is thread:
                 self.app.current_thread = None
+            if self.app.current_thread is None:
+                self.app.is_processing = False
 
     def is_thread_running(self):
         with self.app.lock:
@@ -250,6 +257,10 @@ class GeoTab:
         if not folder:
             messagebox.showwarning(_("提示"), _("请先选择一个文件夹"))
             return
+        # 全局互斥：日期页等其它任务进行中时禁止启动
+        if not self.app.acquire_processing():
+            messagebox.showwarning(_("处理中"), _("其他任务正在处理中，请等待完成"))
+            return
         self._only_wpd_cache = self.only_process_with_date.get()
 
         self.progress_var.set(0)
@@ -268,20 +279,43 @@ class GeoTab:
             self.app.initial_a_count = 0
             self.app.initial_b_count = 0
             self.app.processed_count = 0
-            self.app.is_processing = True
             t = threading.Thread(target=self._extract_wrapper, args=(folder,), daemon=True)
             self.app.current_thread = t
+        self.app.register_thread(t)
         t.start()
 
     def start_process_thread(self):
         if self.is_thread_running():
             messagebox.showwarning(_("处理中"), _("请等待当前任务完成"))
             return
-        self._threshold_min_cache = self.time_threshold.get()
+        if not self.app.acquire_processing():
+            messagebox.showwarning(_("处理中"), _("其他任务正在处理中，请等待完成"))
+            return
+        # 用户可能输入非数字：非法输入时提示并还原为上次有效值，避免静默使用默认值
+        try:
+            threshold = int(self.time_threshold.get())
+        except Exception:
+            messagebox.showwarning(
+                _("输入错误"),
+                _("时间差阈值必须是整数，已还原为上次有效值: ") + str(self._threshold_min_cache),
+                parent=self.app.root)
+            self.time_threshold.set(self._threshold_min_cache)
+            self.app.release_processing()
+            return
+        if threshold < 0:
+            messagebox.showwarning(
+                _("输入错误"),
+                _("时间差阈值不能为负数，已还原为上次有效值: ") + str(self._threshold_min_cache),
+                parent=self.app.root)
+            self.time_threshold.set(self._threshold_min_cache)
+            self.app.release_processing()
+            return
+        self._threshold_min_cache = threshold
         with self.app.lock:
-            self.app.is_processing = True
             t = threading.Thread(target=self._process_wrapper, daemon=True)
             self.app.current_thread = t
+        self.update_ui_state(True)
+        self.app.register_thread(t)
         t.start()
 
     def _extract_wrapper(self, folder):
@@ -291,7 +325,7 @@ class GeoTab:
             self.root_after(lambda e=e: messagebox.showerror(
                 _("错误"), _("提取图像信息时出错: ") + str(e)))
         finally:
-            self.root_after(lambda: self.update_ui_state(False))
+            self.root_after(lambda t=threading.current_thread(): self.update_ui_state(False, t))
 
     def _process_wrapper(self):
         try:
@@ -300,11 +334,11 @@ class GeoTab:
             self.root_after(lambda e=e: messagebox.showerror(
                 _("错误"), _("处理位置信息时出错: ") + str(e)))
         finally:
-            self.root_after(lambda: self.update_ui_state(False))
+            self.root_after(lambda t=threading.current_thread(): self.update_ui_state(False, t))
 
     def root_after(self, callback):
         try:
-            self.app.root.after(0, callback)
+            self.app.post_to_ui(callback)
         except Exception:
             traceback.print_exc()
 
@@ -325,8 +359,14 @@ class GeoTab:
         self.root_after(lambda: self.result_text.see(tk.END))
         self.root_after(lambda: self.result_text.config(state='disabled'))
 
+        # 节流：进度条按 1% 粒度更新，避免每个文件都排队 Tk 回调导致 UI 卡顿
+        _last_pct = [None]
+
         def progress_callback(pct):
-            self.root_after(lambda: self.progress_var.set(pct))
+            p = int(pct)
+            if _last_pct[0] != p or p >= 100:
+                _last_pct[0] = p
+                self.root_after(lambda: self.progress_var.set(p))
 
         def log_callback(done, total):
             self.root_after(lambda d=done, t=total: self.status_var.set(
@@ -351,16 +391,20 @@ class GeoTab:
         self.root_after(lambda: self.progress_var.set(100))
 
         if gps_data:
-            self.root_after(lambda: self.result_text.insert(
-                tk.END, _("从GPX文件中解析出 ") + str(len(gps_data)) + _(" 个GPS轨迹点。") + "\n\n"))
+            self.root_after(lambda: (
+                self.result_text.config(state='normal'),
+                self.result_text.insert(
+                    tk.END, _("从GPX文件中解析出 ") + str(len(gps_data)) + _(" 个GPS轨迹点。") + "\n\n"),
+                self.result_text.config(state='disabled'),
+            ))
 
         total_parts = []
         if a_list:
             total_parts.append(_("有位置信息的图像示例:"))
             fi = a_list[0]
             time_str = fi.dt.strftime('%Y-%m-%d %H:%M:%S') if fi.dt and fi.dt != datetime.min else _('未知')
-            lat_str = f"{fi.latitude:.6f}" if fi.latitude is not None else _('未知')
-            lon_str = f"{fi.longitude:.6f}" if fi.longitude is not None else _('未知')
+            lat_str = f"{fi.latitude:.8f}" if fi.latitude is not None else _('未知')
+            lon_str = f"{fi.longitude:.8f}" if fi.longitude is not None else _('未知')
             alt_str = f"{fi.altitude:.2f}m" if fi.altitude is not None else _('未知')
             total_parts.append(f"  {fi.filename}: " + _("时间") + f"={time_str}, " + _("位置") + f"=({lat_str}, {lon_str}), " + _("高度") + f"={alt_str}")
             if len(a_list) > 1:
@@ -398,12 +442,15 @@ class GeoTab:
         self.root_after(lambda: self.status_var.set(_("迭代进度: ") + str(total_scanned) + "/" + str(total_scanned)))
 
     def process_location_info(self):
-        self.root_after(lambda: self.update_ui_state(True))
-
-        if not self.app.b and not self.app.gps_data:
+        # 互斥与按钮状态已由 start_process_thread 在启动时设置
+        with self.app.lock:
+            has_b = bool(self.app.b)
+            has_a = bool(self.app.a)
+            has_gps = bool(self.app.gps_data)
+        if not has_b and not has_gps:
             self.root_after(lambda: self.show_messagebox("info", _("提示"), _("没有需要处理位置信息的图像和GPS数据")))
             return
-        if not self.app.a and not self.app.gps_data:
+        if not has_a and not has_gps:
             self.root_after(lambda: self.show_messagebox("info", _("提示"), _("没有可用于参考的位置信息")))
             return
 
@@ -416,12 +463,21 @@ class GeoTab:
         self.root_after(lambda: self.result_text.insert(tk.END, _("正在处理位置信息...") + "\n\n"))
         self.root_after(lambda: self.result_text.see(tk.END))
 
+        # 节流：进度按 1% 粒度、日志每 20 个文件更新一次
+        _last_pct = [None]
+        _log_count = [0]
+
         def progress_callback(pct, processed=0, total=0, label=None):
-            self.root_after(lambda: self.progress_var.set(pct))
+            p = int(pct)
+            if _last_pct[0] != p or p >= 100:
+                _last_pct[0] = p
+                self.root_after(lambda: self.progress_var.set(p))
             if total > 0:
-                text = (label or _('比对进度')) + _(": ") + str(processed) + "/" + str(total)
-                self.root_after(
-                    lambda t=text: self.status_var.set(t))
+                _log_count[0] += 1
+                if _log_count[0] % 20 == 0 or processed >= total:
+                    text = (label or _('比对进度')) + _(": ") + str(processed) + "/" + str(total)
+                    self.root_after(
+                        lambda t=text: self.status_var.set(t))
 
         def iteration_callback(iteration, max_iter):
             self.root_after(
@@ -500,7 +556,12 @@ class GeoTab:
                 continue
 
     def show_results(self):
-        if not self.app.a and not self.app.b:
+        if self.is_thread_running():
+            messagebox.showwarning(_("处理中"), _("请等待当前任务完成"))
+            return
+        with self.app.lock:
+            has_data = bool(self.app.a) or bool(self.app.b)
+        if not has_data:
             self.show_messagebox("info", _("提示"), _("请先提取图像信息"))
             return
 
@@ -517,7 +578,12 @@ class GeoTab:
         self.result_window = ResultsWindow(self)
 
     def export_results(self):
-        if not self.app.a and not self.app.b:
+        if self.is_thread_running():
+            messagebox.showwarning(_("处理中"), _("请等待当前任务完成"))
+            return
+        with self.app.lock:
+            has_data = bool(self.app.a) or bool(self.app.b)
+        if not has_data:
             self.show_messagebox("info", _("提示"), _("没有可导出的数据，请先提取图像信息"))
             return
 
@@ -544,7 +610,7 @@ class GeoTab:
             elif ext == '.json':
                 export_to_json(export_file, self.app.a, self.app.b, gps_data_list)
             elif ext == '.gpx':
-                export_to_gpx(export_file, self.app.a, gps_data_list)
+                export_to_gpx(export_file, self.app.a)
             else:
                 stats = generate_statistics(
                     self.app.a, self.app.b, gps_data_list,

@@ -30,15 +30,18 @@ def _get_dt(obj):
 
 
 def _to_utc_naive(dt):
-    """将任意 datetime 转为 UTC 无时区 datetime，确保比较基准一致
+    """将任意 datetime 转为本地无时区 datetime，确保比较基准一致
 
-    若 dt 带有时区信息，先转换为 UTC 再剥离 tzinfo；
-    若已是 naive datetime，直接返回。
+    照片 EXIF 日期、GPX 时间等在数据引入时均已按"本地时间"存储，
+    因此这里统一把带时区的值先转成本地时间再剥离 tzinfo，
+    保证带偏移值（如视频 +08:00）与本地 naive 值在同一条时间线上比较。
+
+    若 dt 已是 naive datetime，直接返回。
     """
     if dt is None:
         return None
     if dt.tzinfo is not None:
-        return dt.astimezone(timezone.utc).replace(tzinfo=None)
+        return dt.astimezone().replace(tzinfo=None)
     return dt
 
 
@@ -70,7 +73,9 @@ def process_location_info(a_list, b_list, gps_data, threshold_minutes=30,
 
     # 构建按时间排序的参考点列表（统一转为 UTC naive 再排序）
     # 参考点来自：已有 GPS 的文件 + GPX 轨迹点
-    all_reference = list(a_list) + list(gps_data)
+    # 加锁快照：主线程的编辑/删除对话框会并发修改 app.a/app.b
+    with lock:
+        all_reference = list(a_list) + list(gps_data)
     sorted_ref = sorted(
         [x for x in all_reference if _get_dt(x) is not None],
         key=lambda x: _to_utc_naive(_get_dt(x)) or datetime.min
@@ -86,7 +91,11 @@ def process_location_info(a_list, b_list, gps_data, threshold_minutes=30,
 
     try:
         # 迭代处理，直到没有文件可以匹配或达到最大迭代次数
-        while iteration < max_iterations and updated_in_iteration and b_list:
+        while iteration < max_iterations and updated_in_iteration:
+            with lock:
+                has_b = bool(b_list)
+            if not has_b:
+                break
             iteration += 1
             updated_in_iteration = False
             updated_files = []
@@ -95,7 +104,9 @@ def process_location_info(a_list, b_list, gps_data, threshold_minutes=30,
                 iteration_callback(iteration, max_iterations)
 
             # 只处理有日期信息的文件（没有日期无法进行时间匹配）
-            b_with_time = [img for img in b_list if img.dt]
+            # 加锁快照迭代，避免与主线程列表修改产生 "list changed size during iteration"
+            with lock:
+                b_with_time = [img for img in b_list if img.dt]
             total = len(b_with_time)
             processed = 0
 
@@ -108,56 +119,87 @@ def process_location_info(a_list, b_list, gps_data, threshold_minutes=30,
             for fut in as_completed(futs):
                 try:
                     result = fut.result()
-                    processed += 1
+                except Exception:
+                    # 匹配阶段真实异常：不应静默吞掉；若未提供日志回调则至少在控制台可查
+                    traceback.print_exc()
+                    if log_callback:
+                        try:
+                            log_callback(_("匹配异常: ") + repr(futs[fut]) + " - " + (traceback.format_exc(limit=1)))
+                        except Exception:
+                            traceback.print_exc()
+                    result = None
+                processed += 1
+                try:
                     if progress_callback:
                         progress_callback(processed / total * 100, processed, total, _("比对进度"))
-
-                    if result:
-                        updated_files.append(result)
-                        updated_in_iteration = True
-                        if log_callback:
-                            log_callback(
-                                _("已更新: ") + f"{result.filename} - "
-                                + _("位置: ") + f"({result.latitude:.6f}, {result.longitude:.6f})"
-                            )
                 except Exception:
                     traceback.print_exc()
-                    processed += 1
-                    if progress_callback:
-                        progress_callback(processed / total * 100, processed, total, _("比对进度"))
+
+                if result:
+                    # result = (img, loc)；写盘成功前不修改 img 对象属性，
+                    # 避免列表渲染读到预置坐标及对象与磁盘不一致
+                    updated_files.append(result)
+                    updated_in_iteration = True
 
             # 将本轮匹配到的文件写入实际的 GPS 数据
             if updated_files:
                 write_total = len(updated_files)
                 write_done = 0
                 write_futs = {}
-                for f in updated_files:
-                    loc = {'latitude': f.latitude, 'longitude': f.longitude, 'altitude': f.altitude}
-                    write_futs[write_pool.submit(_update_file_location, f.path, loc)] = f
+                for f, loc in updated_files:
+                    write_futs[write_pool.submit(_update_file_location, f.path, loc)] = (f, loc)
+                moved_files = []
                 for wfut in as_completed(write_futs):
-                    f = write_futs[wfut]
+                    f, loc = write_futs[wfut]
+                    succeeded = False
+                    err_msg = ""
                     try:
                         wfut.result()
                         write_done += 1
                         updated_count += 1
-                        with lock:
-                            if f in b_list:
-                                b_list.remove(f)
-                            a_list.append(f)
+                        moved_files.append((f, loc))
+                        succeeded = True
                     except Exception as write_err:
                         write_done += 1
                         err_msg = str(write_err) if str(write_err) else type(write_err).__name__
                         retries = getattr(f, '_write_retries', 0) + 1
                         f._write_retries = retries
+                    # 回调无论成功失败都要执行，但回调异常绝不能干扰业务结果判定
+                    try:
                         if log_callback:
-                            log_callback(
-                                _("写入失败") + f"({retries}/3): {f.filename} - {err_msg}"
-                            )
+                            # 写盘成功后才输出"已更新"日志，避免先报成功再报失败
+                            if succeeded:
+                                log_callback(
+                                    _("已更新: ") + f"{f.filename} - "
+                                    + _("位置: ") + f"({loc['latitude']:.8f}, {loc['longitude']:.8f})"
+                                )
+                            else:
+                                log_callback(
+                                    _("写入失败") + f"({retries}/3): {f.filename} - {err_msg}"
+                                )
+                    except Exception:
+                        traceback.print_exc()
                     if progress_callback:
                         progress_callback(write_done / write_total * 100, write_done, write_total, _("写入进度"))
+                if moved_files:
+                    # 批量移动分类：O(n) 重建列表，避免锁内逐文件 in/remove 的 O(n²)
+                    with lock:
+                        ids_in_b = {id(x) for x in b_list}
+                        to_move = [(f, loc) for f, loc in moved_files if id(f) in ids_in_b]
+                        if to_move:
+                            rset = {id(f) for f, _ in to_move}
+                            b_list[:] = [x for x in b_list if id(x) not in rset]
+                            a_list.extend(f for f, _ in to_move)
+                        # 写盘成功后才把坐标写入对象（锁内一次性完成），
+                        # 保证对象与磁盘实际状态一致且主线程渲染无撕裂读
+                        for f, loc in to_move:
+                            f.latitude = loc['latitude']
+                            f.longitude = loc['longitude']
+                            f.altitude = loc['altitude']
 
             # 重新构建排序参考列表（包含本轮新匹配的文件，统一时区后再排序）
-            all_reference = list(a_list) + list(gps_data)
+            with lock:
+                all_reference = list(a_list) + list(gps_data)
             sorted_ref = sorted(
                 [x for x in all_reference if _get_dt(x) is not None],
                 key=lambda x: _to_utc_naive(_get_dt(x)) or datetime.min
@@ -172,8 +214,9 @@ def process_location_info(a_list, b_list, gps_data, threshold_minutes=30,
             traceback.print_exc()
 
     # 最终按时间排序两个列表（统一时区后再排序）
-    a_list.sort(key=lambda x: _to_utc_naive(x.dt) if x.dt else datetime.min)
-    b_list.sort(key=lambda x: _to_utc_naive(x.dt) if x.dt else datetime.min)
+    with lock:
+        a_list.sort(key=lambda x: _to_utc_naive(x.dt) if x.dt else datetime.min)
+        b_list.sort(key=lambda x: _to_utc_naive(x.dt) if x.dt else datetime.min)
 
     return updated_count, a_list, b_list
 
@@ -181,7 +224,9 @@ def process_location_info(a_list, b_list, gps_data, threshold_minutes=30,
 def _match_single_image(img_info, sorted_ref, threshold_minutes, max_retries=3):
     """匹配单个文件到最近的 GPS 参考点
 
-    如果找到时间差在阈值内的参考点，直接将位置信息赋值给文件对象。
+    如果找到时间差在阈值内的参考点，返回 (img_info, 位置字典)；
+    匹配成功后不修改 img_info 对象属性，由调用方在写盘成功后再写入，
+    避免对象与磁盘不一致及主线程渲染的撕裂读。
     写入失败的文件会重试最多 max_retries 次。
 
     Args:
@@ -191,7 +236,7 @@ def _match_single_image(img_info, sorted_ref, threshold_minutes, max_retries=3):
         max_retries: 写入失败最大重试次数（默认 3）
 
     Returns:
-        匹配成功返回更新后的 MediaFileInfo，否则返回 None
+        匹配成功返回 (MediaFileInfo, dict)，否则返回 None
     """
     if img_info.dt is None:
         return None
@@ -203,10 +248,11 @@ def _match_single_image(img_info, sorted_ref, threshold_minutes, max_retries=3):
 
     closest = _find_closest_by_time(img_info.dt, sorted_ref, threshold_minutes)
     if closest:
-        img_info.latitude = closest.latitude
-        img_info.longitude = closest.longitude
-        img_info.altitude = closest.altitude
-        return img_info
+        return img_info, {
+            'latitude': closest.latitude,
+            'longitude': closest.longitude,
+            'altitude': closest.altitude,
+        }
     return None
 
 

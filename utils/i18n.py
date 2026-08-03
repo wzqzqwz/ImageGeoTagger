@@ -22,7 +22,7 @@ _SUPPORTED = {
 def _detect_system_lang():
     """检测系统语言，返回语言代码"""
     try:
-        code, _ = locale.getdefaultlocale()
+        code = locale.getlocale()[0]
         if code:
             code = code.split('_')[0]
             if code in _SUPPORTED:

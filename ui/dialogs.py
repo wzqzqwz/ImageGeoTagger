@@ -11,6 +11,7 @@ import tkinter as tk
 from tkinter import ttk
 from ui import custom_msgbox as messagebox
 from utils.i18n import _
+from utils.media_utils import format_gps_coord
 
 MAP_SELECTOR_URL = "https://maps.apple.com"
 MAP_SELECTOR_URL_BACKUP = "https://guihuayun.com/maps/getxy.php?area"
@@ -33,6 +34,19 @@ def _is_url_reachable(url):
     except Exception:
         return False
 
+
+def _open_map_selector_async(app, callback):
+    """异步检测首选地图服务可达性后回调，避免同步 socket 连接阻塞 UI 线程"""
+    def check():
+        try:
+            reachable = _is_url_reachable(MAP_SELECTOR_URL)
+        except Exception:
+            reachable = False
+        app.post_to_ui(lambda: callback(reachable))
+    t = threading.Thread(target=check, daemon=True)
+    app.register_thread(t)
+    t.start()
+
 from utils.exif_utils import (
     update_image_gps, update_raw_gps, update_video_gps, update_audio_gps,
     remove_gps_info
@@ -44,7 +58,7 @@ from services.date_processor import (
 )
 from utils.platform_utils import open_file_with_system
 from services.geo_processor import (
-    find_files_with_same_location, batch_update_same_location_files
+    find_files_with_same_location
 )
 
 
@@ -165,6 +179,7 @@ class EditCoordinatesDialog:
             if self.window in app.edit_windows:
                 app.edit_windows.remove(self.window)
             self.window.destroy()
+        self._on_close = on_close
         self.window.protocol("WM_DELETE_WINDOW", on_close)
 
         self._build_ui()
@@ -180,11 +195,11 @@ class EditCoordinatesDialog:
         form.pack(padx=12, pady=5, fill=tk.X)
 
         self.lat_var = tk.StringVar(
-            value=str(self.file_info.latitude) if self.file_info.latitude is not None else "")
+            value=format_gps_coord(self.file_info.latitude))
         self.lon_var = tk.StringVar(
-            value=str(self.file_info.longitude) if self.file_info.longitude is not None else "")
+            value=format_gps_coord(self.file_info.longitude))
         self.alt_var = tk.StringVar(
-            value=str(self.file_info.altitude) if self.file_info.altitude is not None else "")
+            value=format_gps_coord(self.file_info.altitude))
 
         ttk.Label(form, text=_("纬度 (Latitude):")).grid(row=0, column=0, sticky=tk.E, pady=4, padx=(0, 10))
         ttk.Entry(form, textvariable=self.lat_var, validate='key',
@@ -229,7 +244,7 @@ class EditCoordinatesDialog:
         ttk.Button(btn_frame, text=_("地图选择"),
                    command=self._map_selector).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text=_("取消"),
-                   command=self.window.destroy).pack(side=tk.LEFT, padx=5)
+                   command=self._on_close).pack(side=tk.LEFT, padx=5)
 
         self.status_label = ttk.Label(self.window, text="", font=('', 14, 'bold'))
         self.status_label.pack(pady=(0, 0))
@@ -239,10 +254,10 @@ class EditCoordinatesDialog:
                   foreground="gray", font=('', 8), wraplength=360).pack(pady=(0, 3))
 
         self.window.bind('<Return>', lambda e: self._save())
-        self.window.bind('<Escape>', lambda e: self.window.destroy())
+        self.window.bind('<Escape>', lambda e: self._on_close())
         self.window.bind('<Control-s>', lambda e: self._save())
         self.window.bind('<Command-s>', lambda e: self._save())
-        self.window.bind('<Command-w>', lambda e: self.window.destroy())
+        self.window.bind('<Command-w>', lambda e: self._on_close())
         self.window.bind('<Control-v>', lambda e: self._paste_location())
         self.window.bind('<FocusIn>', lambda e: self._update_clip_status())
 
@@ -260,9 +275,9 @@ class EditCoordinatesDialog:
         lon = self.file_info.longitude
         alt = self.file_info.altitude
         if lat is not None and lon is not None:
-            text = f"{lon}, {lat}"
+            text = f"{format_gps_coord(lon)}, {format_gps_coord(lat)}"
             if alt is not None:
-                text += f", {alt}"
+                text += f", {format_gps_coord(alt)}"
             try:
                 self.window.clipboard_clear()
                 self.window.clipboard_append(text)
@@ -281,7 +296,7 @@ class EditCoordinatesDialog:
             self._update_clip_status()
 
             messagebox.showinfo(_("已复制"),
-                                _("纬度: ") + str(lat) + "\n" + _("经度: ") + str(lon) + "\n" + _("高度: ") + (str(alt) or _('无')) + "\n\n" + _("(已写入系统剪贴板)"),
+                                _("纬度: ") + format_gps_coord(lat) + "\n" + _("经度: ") + format_gps_coord(lon) + "\n" + _("高度: ") + (format_gps_coord(alt) or _('无')) + "\n\n" + _("(已写入系统剪贴板)"),
                                 parent=self.window)
 
     def _parse_coordinates(self, content):
@@ -319,9 +334,9 @@ class EditCoordinatesDialog:
                     + _("是否仍要粘贴？"), parent=self.window):
                     return
 
-        self.lat_var.set(str(clip['latitude']) if clip['latitude'] is not None else "")
-        self.lon_var.set(str(clip['longitude']) if clip['longitude'] is not None else "")
-        self.alt_var.set(str(clip['altitude']) if clip['altitude'] is not None else "")
+        self.lat_var.set(format_gps_coord(clip['latitude']) if clip['latitude'] is not None else "")
+        self.lon_var.set(format_gps_coord(clip['longitude']) if clip['longitude'] is not None else "")
+        self.alt_var.set(format_gps_coord(clip['altitude']) if clip['altitude'] is not None else "")
 
     def _update_clip_status(self):
         try:
@@ -350,7 +365,7 @@ class EditCoordinatesDialog:
 
         ic = self.app.location_clipboard
         if ic['latitude'] is not None:
-            text = (_("剪贴板: ") + f"({ic['latitude']}, {ic['longitude']})"
+            text = (_("剪贴板: ") + f"({format_gps_coord(ic['latitude'])}, {format_gps_coord(ic['longitude'])})"
                     + _(" | 来源: ") + ic.get('source_file', _('未知')))
             if ic.get('timestamp'):
                 age = (datetime.now() - ic['timestamp']).total_seconds()
@@ -361,6 +376,11 @@ class EditCoordinatesDialog:
         self.clip_status_var.set("")
 
     def _save(self):
+        # 全局互斥：防止与后台 geo 处理并发写同一文件
+        if not self.app.acquire_processing():
+            messagebox.showwarning(_("警告"), _("其他任务正在处理中，请等待完成"), parent=self.window)
+            return
+        self._processing_acquired = True
         try:
             new_lat = self.lat_var.get().strip()
             new_lon = self.lon_var.get().strip()
@@ -372,15 +392,19 @@ class EditCoordinatesDialog:
 
             if (lat_val is None) != (lon_val is None):
                 messagebox.showerror(_("错误"), _("纬度和经度必须同时填写或同时留空"), parent=self.window)
+                self._release_if_acquired()
                 return
             if lat_val is not None and not -90 <= lat_val <= 90:
                 messagebox.showerror(_("错误"), _("纬度必须在-90到90之间"), parent=self.window)
+                self._release_if_acquired()
                 return
             if lon_val is not None and not -180 <= lon_val <= 180:
                 messagebox.showerror(_("错误"), _("经度必须在-180到180之间"), parent=self.window)
+                self._release_if_acquired()
                 return
 
             old_lat, old_lon = self.file_info.latitude, self.file_info.longitude
+            self._old_lat, self._old_lon = old_lat, old_lon
 
             needs_batch = False
             same_loc_files = []
@@ -394,7 +418,7 @@ class EditCoordinatesDialog:
                     if same_loc_files:
                         msg = (_("发现 ") + str(len(same_loc_files))
                                + _(" 个文件与 '") + self.file_info.filename + "'\n"
-                               + _("具有相同的位置 (") + f"{old_lat:.6f}, {old_lon:.6f}" + _(")。\n\n")
+                               + _("具有相同的位置 (") + f"{old_lat:.8f}, {old_lon:.8f}" + _(")。\n\n")
                                + _("是否要将这些文件的位置也一并更新？"))
                         dlg = tk.Toplevel(self.window)
                         dlg.title(_("确认批量修改"))
@@ -422,6 +446,7 @@ class EditCoordinatesDialog:
                         dlg.protocol("WM_DELETE_WINDOW", lambda: set_result(0))
                         self.window.wait_window(dlg)
                         if result[0] == 0:
+                            self._release_if_acquired()
                             return
                         needs_batch = (result[0] == 2)
 
@@ -444,65 +469,132 @@ class EditCoordinatesDialog:
             self.file_info.altitude = alt_val
 
             if needs_batch and same_loc_files:
-                from concurrent.futures import ThreadPoolExecutor, as_completed
-                total = len(same_loc_files)
-                rw = self.results_window
-                if rw:
-                    rw.progress_bar['value'] = 0
-                    rw.progress_bar['maximum'] = total
-                    rw.progress_label.config(text=_("批量更新中... 0/") + str(total))
+                self._start_same_location_batch(lat_val, lon_val, alt_val, same_loc_files)
+                return
+            self._finalize_save()
 
-                def process_one(f):
-                    try:
-                        loc = {'latitude': lat_val, 'longitude': lon_val, 'altitude': alt_val}
-                        ext = os.path.splitext(f.path)[1].lower()
-                        if ext in RAW_EXTENSIONS:
-                            update_raw_gps(f.path, loc)
-                        elif ext in VIDEO_EXTENSIONS:
-                            update_video_gps(f.path, loc)
-                        elif ext in AUDIO_EXTENSIONS:
-                            update_audio_gps(f.path, loc)
-                        else:
-                            update_image_gps(f.path, loc)
-                        f.latitude = lat_val
-                        f.longitude = lon_val
-                        f.altitude = alt_val
-                        return True
-                    except Exception:
-                        return False
+        except ValueError:
+            try:
+                messagebox.showerror(_("错误"), _("请输入有效的数值"), parent=self.window)
+            except Exception:
+                traceback.print_exc()
+            self._release_if_acquired()
+        except Exception:
+            traceback.print_exc()
+            try:
+                messagebox.showerror(_("错误"), _("操作失败"), parent=self.window)
+            except Exception:
+                traceback.print_exc()
+            self._release_if_acquired()
 
-                done = 0
-                batch_failures = 0
-                _lock = threading.Lock()
+    def _release_if_acquired(self):
+        if getattr(self, '_processing_acquired', False):
+            self.app.release_processing()
+            self._processing_acquired = False
+
+    def _start_same_location_batch(self, lat_val, lon_val, alt_val, same_loc_files):
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        total = len(same_loc_files)
+        rw = self.results_window
+        if rw and rw.window.winfo_exists():
+            rw.progress_bar['value'] = 0
+            rw.progress_bar['maximum'] = total
+            rw.progress_label.config(text=_("批量更新中... 0/") + str(total))
+
+        def process_one(f):
+            try:
+                loc = {'latitude': lat_val, 'longitude': lon_val, 'altitude': alt_val}
+                ext = os.path.splitext(f.path)[1].lower()
+                if ext in RAW_EXTENSIONS:
+                    update_raw_gps(f.path, loc)
+                elif ext in VIDEO_EXTENSIONS:
+                    update_video_gps(f.path, loc)
+                elif ext in AUDIO_EXTENSIONS:
+                    update_audio_gps(f.path, loc)
+                else:
+                    update_image_gps(f.path, loc)
+                # 工作线程只写磁盘，不修改 MediaFileInfo 属性，
+                # 属性更新统一在主线程 _finish_same_location_batch 中加锁完成，避免撕裂读
+                return True, ('set', f, lat_val, lon_val, alt_val)
+            except Exception:
+                return False, None
+
+        def batch_worker():
+            done = 0
+            batch_failures = 0
+            moves = []
+            _lock = threading.Lock()
+            try:
                 with ThreadPoolExecutor(max_workers=min(32, (os.cpu_count() or 4) * 2)) as pool:
                     futs = {pool.submit(process_one, f): f for f in same_loc_files}
                     for fut in as_completed(futs):
-                        if not fut.result():
+                        ok, move = fut.result()
+                        if ok:
+                            with _lock:
+                                moves.append(move)
+                        else:
                             with _lock:
                                 batch_failures += 1
                         with _lock:
                             done += 1
-                        if rw:
-                            rw.progress_bar['value'] = done
-                            rw.progress_label.config(text=_("批量更新中... ") + str(done) + "/" + str(total))
-                            rw.window.update_idletasks()
+                        if rw and (done % 5 == 0 or done == total):
+                            self.app.post_to_ui(
+                                lambda d=done, t=total: self._update_batch_progress(rw, d, t))
+            except Exception:
+                traceback.print_exc()
+            self.app.post_to_ui(
+                lambda: self._finish_same_location_batch(batch_failures, total, moves))
 
+        t = threading.Thread(target=batch_worker, daemon=True)
+        self.app.register_thread(t)
+        t.start()
+
+    def _update_batch_progress(self, rw, done, total):
+        try:
+            if rw.window.winfo_exists():
+                rw.progress_bar.config(value=done)
+                rw.progress_label.config(
+                    text=_("批量更新中... ") + str(done) + "/" + str(total))
+        except Exception:
+            traceback.print_exc()
+
+    def _finish_same_location_batch(self, batch_failures, total, moves=None):
+        rw = self.results_window
+        try:
+            if rw:
+                rw.progress_bar['maximum'] = 100
+            if batch_failures > 0:
                 if rw:
-                    rw.progress_bar['maximum'] = 100
-                if batch_failures > 0:
-                    if rw:
-                        rw.progress_label.config(text=_("部分失败: ") + str(batch_failures) + _(" 个失败"))
-                    else:
-                        messagebox.showwarning(_("部分失败"),
-                            _("有 ") + str(batch_failures) + _(" 个相同位置的文件更新失败"),
-                            parent=self.window)
-
+                    rw.progress_label.config(text=_("部分失败: ") + str(batch_failures) + _(" 个失败"))
+                else:
+                    messagebox.showwarning(_("部分失败"),
+                        _("有 ") + str(batch_failures) + _(" 个相同位置的文件更新失败"),
+                        parent=self.window)
+        except Exception:
+            traceback.print_exc()
+        if moves:
+            # 主线程加锁统一写入属性，避免 worker 线程直接改对象造成撕裂读
             with self.app.lock:
-                if (old_lat is None or old_lon is None) and (lat_val is not None and lon_val is not None):
+                for move in moves:
+                    try:
+                        fi, lat, lon, alt = (move[1], move[2], move[3], move[4])
+                        fi.latitude = lat
+                        fi.longitude = lon
+                        fi.altitude = alt
+                    except Exception:
+                        traceback.print_exc()
+        self._finalize_save()
+
+    def _finalize_save(self):
+        try:
+            with self.app.lock:
+                if (self._old_lat is None or self._old_lon is None) and \
+                        (self.file_info.latitude is not None and self.file_info.longitude is not None):
                     if self.file_info in self.app.b:
                         self.app.b.remove(self.file_info)
                         self.app.a.append(self.file_info)
-                elif (old_lat is not None and old_lon is not None) and (lat_val is None or lon_val is None):
+                elif (self._old_lat is not None and self._old_lon is not None) and \
+                        (self.file_info.latitude is None or self.file_info.longitude is None):
                     if self.file_info in self.app.a:
                         self.app.a.remove(self.file_info)
                         self.app.b.append(self.file_info)
@@ -526,24 +618,26 @@ class EditCoordinatesDialog:
                                                    rw.progress_label.config(text=_("位置信息已更新"))))
             except Exception:
                 traceback.print_exc()
-            self.window.destroy()
+            self._on_close()
 
-        except ValueError:
-            try:
-                messagebox.showerror(_("错误"), _("请输入有效的数值"), parent=self.window)
-            except Exception:
-                traceback.print_exc()
         except Exception:
             traceback.print_exc()
             try:
                 messagebox.showerror(_("错误"), _("操作失败"), parent=self.window)
             except Exception:
                 traceback.print_exc()
+        finally:
+            self._release_if_acquired()
 
     def _clear_gps(self):
         if messagebox.askyesno(_("确认清空"),
                                 _("确定要清空 '") + self.file_info.filename + _(" 的GPS信息吗？"),
                                 parent=self.window):
+            # 全局互斥：防止与后台 geo 处理并发写同一文件
+            if not self.app.acquire_processing():
+                messagebox.showwarning(_("警告"), _("其他任务正在处理中，请等待完成"), parent=self.window)
+                return
+            self._processing_acquired = True
             try:
                 remove_gps_info(self.file_info.path)
                 self.file_info.latitude = None
@@ -573,19 +667,25 @@ class EditCoordinatesDialog:
                         messagebox.showinfo(_("成功"), _("GPS信息已清空"))
                     except Exception:
                         traceback.print_exc()
-                self.window.destroy()
+                self._on_close()
             except Exception:
                 traceback.print_exc()
                 try:
                     messagebox.showerror(_("错误"), _("操作失败"), parent=self.window)
                 except Exception:
                     traceback.print_exc()
+            finally:
+                self._release_if_acquired()
 
     def _map_selector(self):
-        if _is_url_reachable(MAP_SELECTOR_URL):
-            webbrowser.open(MAP_SELECTOR_URL)
-        else:
-            webbrowser.open(MAP_SELECTOR_URL_BACKUP)
+        _open_map_selector_async(self.app, self._open_selected_map)
+
+    def _open_selected_map(self, primary_reachable):
+        try:
+            url = MAP_SELECTOR_URL if primary_reachable else MAP_SELECTOR_URL_BACKUP
+            webbrowser.open(url)
+        except Exception:
+            traceback.print_exc()
 
 
 class EditShootingDateDialog:
@@ -610,12 +710,13 @@ class EditShootingDateDialog:
             try:
                 self.current_date = datetime.strptime(orig_date, '%Y-%m-%d %H:%M:%S')
             except Exception:
-                self.current_date = datetime.now()
+                # 日期解析失败时保持未知（显示"无"），避免误用当前时间覆盖真实日期
+                self.current_date = None
         else:
             dt = get_val(file_info, 'dt', None)
+            # 无日期信息时保持空值，绝不预填当前时间，
+            # 否则用户随手按回车就会把"今天"误写入文件
             self.current_date = dt if dt and dt != datetime.min else None
-            if not self.current_date and orig_date is None:
-                self.current_date = datetime.now()
 
         self._create_window()
 
@@ -711,6 +812,11 @@ class EditShootingDateDialog:
         _paste_date_to_entries(self.window, self.date_entry, self.time_entry)
 
     def _save(self):
+        # 全局互斥：防止与后台 geo 处理并发写同一文件
+        if not self.app.acquire_processing():
+            messagebox.showwarning(_("警告"), _("其他任务正在处理中，请等待完成"), parent=self.window)
+            return
+        self._processing_acquired = True
         try:
             date_str = self.date_entry.get().strip()
             time_str = self.time_entry.get().strip()
@@ -736,7 +842,8 @@ class EditShootingDateDialog:
                 if new_dt is not None:
                     self.file_info['original_date'] = new_dt.strftime('%Y-%m-%d %H:%M:%S')
                 else:
-                    self.file_info['original_date'] = _('无')
+                    # 存 None 而非翻译串，避免排序/过滤/导出/切换语言后行为漂移
+                    self.file_info['original_date'] = None
                 self.file_info['manual_edit_date'] = True
                 self.file_info['status'] = FileStatus.MANUALLY_EDITED
             else:
@@ -816,6 +923,10 @@ class EditShootingDateDialog:
                 messagebox.showerror(_("错误"), _("操作失败"), parent=self.window)
             except Exception:
                 traceback.print_exc()
+        finally:
+            if getattr(self, '_processing_acquired', False):
+                self.app.release_processing()
+                self._processing_acquired = False
 
 
 class BatchDateEditDialog:
@@ -922,6 +1033,12 @@ class BatchDateEditDialog:
                 return
             new_dt = datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M:%S")
 
+            # 全局互斥：防止与后台 geo 处理并发写同一文件
+            if not self.app.acquire_processing():
+                messagebox.showwarning(_("警告"), _("其他任务正在处理中，请等待完成"), parent=self.window)
+                return
+            self._processing_acquired = True
+
             self.window.destroy()
 
             if self.refresh_callback:
@@ -929,6 +1046,8 @@ class BatchDateEditDialog:
                     self.refresh_callback(new_dt, self.selected_files)
                 except Exception:
                     traceback.print_exc()
+                finally:
+                    self._release_if_acquired()
                 return
 
             from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -943,6 +1062,10 @@ class BatchDateEditDialog:
                         fi['original_date'] = new_dt.strftime('%Y-%m-%d %H:%M:%S')
                         fi['manual_edit_date'] = True
                         fi['status'] = FileStatus.DATE_CHANGED
+                    else:
+                        # 同步更新内存中的日期，避免界面显示旧日期造成"没改成功"错觉
+                        fi.dt = new_dt
+                        fi.manual_edit_date = True
                     return True, None
                 except Exception as e:
                     return False, str(e)
@@ -969,26 +1092,39 @@ class BatchDateEditDialog:
                     traceback.print_exc()
 
             prog_thread = threading.Thread(target=process, daemon=True)
+            self.app.register_thread(prog_thread)
             self._update_results_progress(0, _("处理中..."))
 
             def poll():
-                alive = prog_thread.is_alive()
-                with prog_lock:
-                    d = prog_done[0]
-                    s = prog_success[0]
-                    f = prog_failed[0]
-                if not alive:
-                    self._finish_up(s, f)
-                    return
-                if prog_total > 0:
-                    pct = d / prog_total * 100
-                    txt = _("处理中...") if d == 0 else (_("进度: ") + str(d) + "/" + str(prog_total))
-                    rw = self.app.geo_tab.result_window
-                    if rw and hasattr(rw, 'progress_bar'):
-                        rw.progress_bar['value'] = pct
-                        rw.progress_label.config(text=txt)
-                        rw.window.update_idletasks()
-                self.app.root.after(200, poll)
+                try:
+                    alive = prog_thread.is_alive()
+                    with prog_lock:
+                        d = prog_done[0]
+                        s = prog_success[0]
+                        f = prog_failed[0]
+                    if not alive:
+                        self._finish_up(s, f)
+                        return
+                    if prog_total > 0:
+                        pct = d / prog_total * 100
+                        txt = _("处理中...") if d == 0 else (_("进度: ") + str(d) + "/" + str(prog_total))
+                        rw = self.app.geo_tab.result_window
+                        if rw is not None and hasattr(rw, 'progress_bar'):
+                            # 结果窗口可能已被用户关闭：winfo_exists 抛 TclError 时跳过刷新
+                            try:
+                                if rw.window.winfo_exists():
+                                    rw.progress_bar['value'] = pct
+                                    rw.progress_label.config(text=txt)
+                                    rw.window.update_idletasks()
+                            except Exception:
+                                pass
+                    self.app.root.after(200, poll)
+                except Exception:
+                    traceback.print_exc()
+                    try:
+                        self.app.root.after(200, poll)
+                    except Exception:
+                        traceback.print_exc()
 
             prog_thread.start()
             poll()
@@ -1014,6 +1150,11 @@ class BatchDateEditDialog:
         except Exception:
             traceback.print_exc()
 
+    def _release_if_acquired(self):
+        if getattr(self, '_processing_acquired', False):
+            self.app.release_processing()
+            self._processing_acquired = False
+
     def _finish_up(self, success, failed):
         try:
             rw = self.app.geo_tab.result_window
@@ -1028,6 +1169,7 @@ class BatchDateEditDialog:
                 self.tree.sync_search()
             except Exception:
                 traceback.print_exc()
+        self._release_if_acquired()
 class BatchLocationEditDialog:
     """批量编辑位置信息对话框"""
 
@@ -1110,14 +1252,23 @@ class BatchLocationEditDialog:
         except Exception:
             traceback.print_exc()
 
+    def _release_if_acquired(self):
+        if getattr(self, '_processing_acquired', False):
+            self.app.release_processing()
+            self._processing_acquired = False
+
     def _parse_coordinates(self, content):
         return _parse_coordinates(content)
 
     def _open_map_selector(self):
-        if _is_url_reachable(MAP_SELECTOR_URL):
-            webbrowser.open(MAP_SELECTOR_URL)
-        else:
-            webbrowser.open(MAP_SELECTOR_URL_BACKUP)
+        _open_map_selector_async(self.app, self._open_selected_map)
+
+    def _open_selected_map(self, primary_reachable):
+        try:
+            url = MAP_SELECTOR_URL if primary_reachable else MAP_SELECTOR_URL_BACKUP
+            webbrowser.open(url)
+        except Exception:
+            traceback.print_exc()
 
     def _paste_location(self):
         try:
@@ -1149,12 +1300,12 @@ class BatchLocationEditDialog:
         clip = self.app.location_clipboard
         if clip['latitude'] is not None and clip['longitude'] is not None:
             self.lat_entry.delete(0, tk.END)
-            self.lat_entry.insert(0, str(clip['latitude']))
+            self.lat_entry.insert(0, format_gps_coord(clip['latitude']))
             self.lon_entry.delete(0, tk.END)
-            self.lon_entry.insert(0, str(clip['longitude']))
+            self.lon_entry.insert(0, format_gps_coord(clip['longitude']))
             if clip['altitude'] is not None:
                 self.alt_entry.delete(0, tk.END)
-                self.alt_entry.insert(0, str(clip['altitude']))
+                self.alt_entry.insert(0, format_gps_coord(clip['altitude']))
             return
 
         try:
@@ -1186,6 +1337,12 @@ class BatchLocationEditDialog:
             messagebox.showerror(_("输入错误"), _("经度必须在 -180 到 180 之间"), parent=self.window)
             return
 
+        # 全局互斥：防止与后台 geo 处理并发写同一文件
+        if not self.app.acquire_processing():
+            messagebox.showwarning(_("警告"), _("其他任务正在处理中，请等待完成"), parent=self.window)
+            return
+        self._processing_acquired = True
+
         self.window.destroy()
 
         import threading
@@ -1194,7 +1351,8 @@ class BatchLocationEditDialog:
         def process_one(fi):
             try:
                 ext = os.path.splitext(str(fi.path))[1].lower()
-                move_info = None
+                # 工作线程只写磁盘，不修改 MediaFileInfo 属性，
+                # 属性更新统一在主线程 _on_loc_batch_done 中加锁完成，避免撕裂读
                 if lat is not None and lon is not None:
                     loc = {'latitude': lat, 'longitude': lon, 'altitude': alt}
                     if ext in RAW_EXTENSIONS:
@@ -1205,21 +1363,10 @@ class BatchLocationEditDialog:
                         update_audio_gps(fi.path, loc)
                     else:
                         update_image_gps(fi.path, loc)
-                    old_has_gps = fi.latitude is not None
-                    fi.latitude = lat
-                    fi.longitude = lon
-                    fi.altitude = alt
-                    if not old_has_gps:
-                        move_info = ('to_a', fi)
+                    return True, ('set', fi, lat, lon, alt)
                 else:
                     remove_gps_info(fi.path)
-                    old_has_gps = fi.latitude is not None
-                    fi.latitude = None
-                    fi.longitude = None
-                    fi.altitude = None
-                    if old_has_gps:
-                        move_info = ('to_b', fi)
-                return True, move_info
+                    return True, ('clear', fi, None, None, None)
             except Exception as e:
                 return False, str(e)
 
@@ -1229,7 +1376,7 @@ class BatchLocationEditDialog:
             failed = 0
             moves = []
             _lock = threading.Lock()
-            self.app.root.after(0, lambda: self._update_results_progress(0, _("处理中...")))
+            self.app.post_to_ui(lambda: self._update_results_progress(0, _("处理中...")))
             with ThreadPoolExecutor(max_workers=min(8, (os.cpu_count() or 4) * 2)) as pool:
                 futs = {pool.submit(process_one, fi): fi for fi in self.selected_files}
                 done = 0
@@ -1245,28 +1392,40 @@ class BatchLocationEditDialog:
                             failed += 1
                     with _lock:
                         done += 1
-                    self.app.root.after(0, lambda d=done, t=total: (
-                        self._update_results_progress(d / t * 100,
-                                                      _("进度: ") + str(d) + "/" + str(total))
-                    ))
-            self.app.root.after(0, lambda s=success, f=failed, mv=moves:
+                    if done % 5 == 0 or done == total:
+                        self.app.post_to_ui(lambda d=done, t=total: (
+                            self._update_results_progress(d / t * 100,
+                                                          _("进度: ") + str(d) + "/" + str(total))
+                        ))
+            self.app.post_to_ui(lambda s=success, f=failed, mv=moves:
                                 self._on_loc_batch_done(s, f, mv))
 
         t = threading.Thread(target=process, daemon=True)
+        self.app.register_thread(t)
         t.start()
 
     def _on_loc_batch_done(self, success, failed, moves=None):
         self._update_results_progress(100, _("完成: ") + str(success) + _("成功/") + str(failed) + _("失败"))
         if moves:
             with self.app.lock:
-                for action, fi in moves:
+                for action, fi, lat, lon, alt in moves:
                     try:
-                        if action == 'to_a' and fi in self.app.b:
-                            self.app.b.remove(fi)
-                            self.app.a.append(fi)
-                        elif action == 'to_b' and fi in self.app.a:
-                            self.app.a.remove(fi)
-                            self.app.b.append(fi)
+                        if action == 'set':
+                            old_has = fi.latitude is not None and fi.longitude is not None
+                            fi.latitude = lat
+                            fi.longitude = lon
+                            fi.altitude = alt
+                            if not old_has and fi in self.app.b:
+                                self.app.b.remove(fi)
+                                self.app.a.append(fi)
+                        else:
+                            old_has = fi.latitude is not None
+                            fi.latitude = None
+                            fi.longitude = None
+                            fi.altitude = None
+                            if old_has and fi in self.app.a:
+                                self.app.a.remove(fi)
+                                self.app.b.append(fi)
                     except Exception:
                         traceback.print_exc()
         try:
@@ -1279,6 +1438,7 @@ class BatchLocationEditDialog:
                 rw.progress_label.config(text=_("完成: ") + str(success) + _("成功/") + str(failed) + _("失败"))
         except Exception:
             traceback.print_exc()
+        self._release_if_acquired()
 
 
 class GpxPointDetails:

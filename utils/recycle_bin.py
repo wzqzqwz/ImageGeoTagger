@@ -80,10 +80,10 @@ def _windows_recycle(file_paths):
             op.pFrom = path_buf
             op.fFlags = _FOF_ALLOWUNDO | _FOF_NOCONFIRMATION | _FOF_SILENT
             result = ctypes.windll.shell32.SHFileOperationW(ctypes.byref(op))
-            if result == 0:
+            if result == 0 and not op.fAnyOperationsAborted:
                 success_count += 1
             else:
-                failed.append((fp, _("错误码: ") + str(result)))
+                failed.append((fp, _("错误码: ") + str(result) if result else _("操作被取消")))
         except Exception as e:
             failed.append((fp, str(e)))
 
@@ -103,11 +103,12 @@ def _macos_trash(file_paths):
             continue
         try:
             posix_path = os.path.abspath(fp)
-            import shlex
-            safe_path = shlex.quote(posix_path)
+            # AppleScript 字符串必须使用双引号（shlex.quote 的 POSIX 单引号会导致语法错误），
+            # 需要转义路径中可能存在的双引号与反斜杠
+            safe_path = posix_path.replace('\\', '\\\\').replace('"', '\\"')
             result = subprocess.run(
                 ['osascript', '-e',
-                 'tell application "Finder" to delete (POSIX file ' + safe_path + ' as POSIX file)'],
+                 'tell application "Finder" to delete (POSIX file "' + safe_path + '" as POSIX file)'],
                 capture_output=True, text=True, timeout=15,
                 errors='replace'
             )

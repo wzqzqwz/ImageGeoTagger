@@ -27,7 +27,7 @@ cd ImageGeoTagger
 pip install -r requirements.txt
 
 # 运行
-python -m .
+python -m main
 ```
 
 ## 项目结构

@@ -2,16 +2,29 @@
 
 import json
 import os
+import queue
 import tkinter as tk
 from tkinter import ttk
 import threading
+import time
 import traceback
 
+from ui import custom_msgbox as messagebox
 from ui.geo_tab import GeoTab
 from ui.date_tab import DateTab
 from utils.i18n import _, get_language, load_lang, get_supported_languages, set_language
 
-CONFIG_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'window_config.json')
+
+def _thread_is_alive(t):
+    """线程是否存活（未启动或已停止均视为不存活，避免 is_alive 抛 RuntimeError"""
+    try:
+        return t.is_alive()
+    except (RuntimeError, AttributeError):
+        return False
+
+# 窗口配置写入用户主目录，避免打包版写入 _MEIPASS 临时目录导致永久失效
+CONFIG_DIR = os.path.join(os.path.expanduser('~'), '.imagegeotagger')
+CONFIG_FILE = os.path.join(CONFIG_DIR, 'window_config.json')
 
 
 class MainWindow:
@@ -45,6 +58,11 @@ class MainWindow:
         self.lock = threading.Lock()
         self.edit_windows = []
 
+        # 后台线程注册表：用于关窗时检测是否有未完成任务
+        self.background_threads = []
+        # 线程安全的主线程回调队列：worker 线程统一经 post_to_ui 投递
+        self._ui_queue = queue.Queue()
+
         self.location_clipboard = {
             'latitude': None, 'longitude': None, 'altitude': None,
             'source_file': None, 'timestamp': None,
@@ -54,20 +72,71 @@ class MainWindow:
         self._create_menu()
         self.root.protocol("WM_DELETE_WINDOW", self._on_window_close)
         self._restore_or_center_window()
+        self.root.after(50, self._drain_ui_queue)
+
+    # ---------- 全局处理互斥 ----------
+    def acquire_processing(self):
+        """尝试获取全局处理权（两个标签页共用，防止同时写同一批文件）。
+
+        Returns:
+            bool: True 表示获取成功
+        """
+        with self.lock:
+            if self.is_processing:
+                return False
+            self.is_processing = True
+            return True
+
+    def release_processing(self):
+        with self.lock:
+            self.is_processing = False
+
+    def is_task_running(self):
+        with self.lock:
+            return self.is_processing
+
+    def register_thread(self, t):
+        with self.lock:
+            # 先清理已结束的线程，避免长时间会话中死线程无限堆积
+            self.background_threads = [
+                old for old in self.background_threads
+                if _thread_is_alive(old)]
+            self.background_threads.append(t)
+
+    # ---------- 线程安全 UI 回调 ----------
+    def post_to_ui(self, callback):
+        """把回调投递到主线程执行（worker 线程专用，替代 root.after）"""
+        self._ui_queue.put(callback)
+
+    def _drain_ui_queue(self):
+        try:
+            while True:
+                fn = self._ui_queue.get_nowait()
+                try:
+                    fn()
+                except Exception:
+                    traceback.print_exc()
+        except queue.Empty:
+            pass
+        try:
+            self.root.after(50, self._drain_ui_queue)
+        except Exception:
+            pass
 
     def _load_window_geometry(self):
         try:
             with open(CONFIG_FILE, 'r') as f:
                 cfg = json.load(f)
                 return cfg.get('geometry')
-        except:
+        except Exception:
             return None
 
     def _save_window_geometry(self):
         try:
+            os.makedirs(CONFIG_DIR, exist_ok=True)
             with open(CONFIG_FILE, 'w') as f:
                 json.dump({'geometry': self.root.geometry()}, f)
-        except:
+        except Exception:
             pass
 
     def _center_window(self):
@@ -84,7 +153,7 @@ class MainWindow:
             title_h = user32.GetSystemMetrics(SM_CYCAPTION)
             border_w = user32.GetSystemMetrics(SM_CXFRAME)
             border_h = user32.GetSystemMetrics(SM_CYFRAME)
-        except:
+        except Exception:
             title_h, border_w, border_h = 31, 8, 8
         total_w = w + 2 * border_w
         total_h = h + title_h + border_h
@@ -100,7 +169,7 @@ class MainWindow:
                 self.root.geometry(geo)
                 self.root.deiconify()
                 return
-            except:
+            except Exception:
                 pass
         self._center_window()
 
@@ -137,6 +206,17 @@ class MainWindow:
     def _on_window_close(self):
         try:
             self._save_window_geometry()
+
+            # 等待后台任务完成，避免 daemon 线程被强杀导致 ExifTool 写入截断损坏文件
+            with self.lock:
+                alive = [t for t in self.background_threads if t.is_alive()]
+            if alive:
+                messagebox.showwarning(
+                    _("警告"),
+                    _("正在处理中，请等待当前任务完成后再退出程序"),
+                    parent=self.root)
+                return
+
             for win in self.edit_windows:
                 try:
                     if win.winfo_exists():
@@ -145,7 +225,11 @@ class MainWindow:
                     pass
             self.root.destroy()
         except Exception:
-            self.root.destroy()
+            traceback.print_exc()
+            try:
+                self.root.destroy()
+            except Exception:
+                pass
 
     def create_widgets(self):
         main = ttk.Frame(self.root, padding="00")

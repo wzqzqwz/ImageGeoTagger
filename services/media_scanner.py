@@ -13,7 +13,7 @@ from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from config import (
-    VIDEO_EXTENSIONS, ALL_MEDIA_EXTENSIONS
+    VIDEO_EXTENSIONS, AUDIO_EXTENSIONS, ALL_MEDIA_EXTENSIONS
 )
 from utils.exif_utils import (
     extract_exif_gps, extract_pil_gps, extract_video_gps_with_exiftool,
@@ -52,8 +52,15 @@ def scan_folder(folder_path, progress_callback=None, only_process_with_date=Fals
     files = []
 
     # 合并遍历：一次 os.walk 同时收集 GPX 和媒体文件
+    # onerror 只跳过无法访问的目录（打印日志继续遍历），
+    # 避免一个无权限子目录中断整个扫描导致文件/轨迹漏扫
+    def _on_walk_error(exc):
+        traceback.print_exc()
+
     try:
-        for r, _, fs in os.walk(folder_path):
+        if not os.path.isdir(folder_path):
+            return [], [], [], 0, 0
+        for r, _, fs in os.walk(folder_path, onerror=_on_walk_error):
             for f in fs:
                 ext = os.path.splitext(f)[1].lower()
                 if ext == '.gpx':
@@ -143,15 +150,18 @@ def _extract_file_info(file_path, only_process_with_date=False):
     if ext not in ALL_MEDIA_EXTENSIONS:
         return info
 
-    # 视频文件 - 使用 ExifTool 提取
-    if ext in VIDEO_EXTENSIONS:
+    # 视频/音频文件 - 使用 ExifTool 提取（音频没有标准 EXIF/PIL 可读，
+    # 走图像路径会导致 exifread 与 PIL 对每个音频文件抛异常刷屏）
+    if ext in VIDEO_EXTENSIONS or ext in AUDIO_EXTENSIONS:
         lat, lon, alt, dt = extract_video_gps_with_exiftool(file_path)
         info.latitude = lat
         info.longitude = lon
         info.altitude = alt
         if dt:
             info.dt = dt
-        if not dt:
+        elif not only_process_with_date:
+            # 仅当未启用"只处理有日期的文件"时才回退到文件系统创建时间，
+            # 否则该选项对视频无效（创建时间几乎总是存在）
             dt = get_file_creation_datetime(Path(file_path))
             if dt:
                 info.dt = dt

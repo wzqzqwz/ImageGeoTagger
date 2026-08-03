@@ -30,6 +30,24 @@ def is_media_file(file_path):
     return Path(file_path).suffix.lower() in ALL_MEDIA_EXTENSIONS
 
 
+def format_gps_coord(value):
+    """格式化 GPS 坐标值用于显示/预填
+
+    坐标经度分秒有理数换算回十进制后存在浮点表示噪声
+    （如 35.420289999999994），固定 8 位小数（1e-8 度 ≈ 1 毫米）
+    并去除尾零，可还原为用户输入的原值（35.42029）。
+
+    Args:
+        value: 经纬度浮点值或 None
+
+    Returns:
+        str: 格式化后的字符串，None 返回空字符串
+    """
+    if value is None:
+        return ''
+    return f"{value:.8f}".rstrip('0').rstrip('.')
+
+
 def parse_datetime_from_filename(filename):
     """从文件名中解析日期时间
 
@@ -52,8 +70,13 @@ def parse_datetime_from_filename(filename):
             groups = match.groups()
             try:
                 if len(groups) == 6:
-                    # 完整日期时间：YYYY-MM-DD HH:MM:SS
-                    year, month, day, hour, minute, second = groups
+                    if len(groups[0]) == 2:
+                        # 时间在前格式：HH-MM-SS_YYYY-MM-DD / HHMMSS_YYYYMMDD
+                        # 前 3 组是时分秒，后 3 组才是年月日
+                        hour, minute, second, year, month, day = groups
+                    else:
+                        # 完整日期时间：YYYY-MM-DD HH:MM:SS
+                        year, month, day, hour, minute, second = groups
                     return datetime(int(year), int(month), int(day),
                                     int(hour), int(minute), int(second))
                 elif len(groups) == 3:
@@ -65,7 +88,7 @@ def parse_datetime_from_filename(filename):
     return None
 
 
-QUICKTIME_EXTENSIONS = frozenset({'.mov', '.mp4', '.m4v'})
+QUICKTIME_EXTENSIONS = frozenset({'.mov', '.mp4', '.m4v', '.3gp', '.3g2'})
 
 
 def get_file_creation_datetime(file_path):
@@ -88,22 +111,25 @@ def get_file_creation_datetime(file_path):
             return datetime.fromtimestamp(stat_result.st_birthtime)
         if platform.system() == 'Windows':
             return datetime.fromtimestamp(stat_result.st_ctime)
-    except (OSError, AttributeError):
+    except (OSError, AttributeError, OverflowError, ValueError):
         traceback.print_exc()
     return None
 
 
-def get_existing_datetime(file_path):
+def get_existing_datetime(file_path, fallback_to_fs=True):
     """获取文件的最佳可用日期时间
 
     优先级（从高到低）：
       1. EXIF 拍摄日期（适用于图像文件）
       2. QuickTime 创建日期（适用于 MOV/MP4 视频）
-      3. 文件系统创建时间
-      4. 文件系统修改时间
+      3. 文件系统创建时间（fallback_to_fs 为 True 时）
+      4. 文件系统修改时间（fallback_to_fs 为 True 时）
 
     Args:
         file_path: 文件路径
+        fallback_to_fs: 是否在无 EXIF 日期时回退到文件系统时间。
+            判断"是否有拍摄日期"时应传 False，否则 Windows/Linux 上
+            创建/修改时间几乎总是存在，会把无 EXIF 日期的文件误判为已有日期。
 
     Returns:
         datetime or None
@@ -122,6 +148,9 @@ def get_existing_datetime(file_path):
         dt = read_quicktime_datetime(file_path)
         if dt is not None:
             return dt
+
+    if not fallback_to_fs:
+        return None
 
     # 第三优先级：文件创建时间
     dt = get_file_creation_datetime(file_path)

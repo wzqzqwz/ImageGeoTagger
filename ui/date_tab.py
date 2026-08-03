@@ -16,7 +16,7 @@ from services.date_processor import (
     MediaDateRenamer, update_file_shooting_date
 )
 from utils.media_utils import (
-    parse_datetime_from_filename, get_existing_datetime, is_media_file
+    parse_datetime_from_filename, get_existing_datetime
 )
 from config import ALL_MEDIA_EXTENSIONS
 from ui.dialogs import (
@@ -25,11 +25,27 @@ from ui.dialogs import (
 from utils.platform_utils import open_file_with_system, show_file_in_explorer
 from utils.recycle_bin import send_to_recycle_bin
 from utils.i18n import _
+from services.export_service import csv_safe
 from models.media_file import FileStatus, status_text, status_sort_key
 try:
     from tkinterdnd2 import DND_FILES
 except ImportError:
     DND_FILES = None
+
+
+def _no_clobber_rename(src, dst):
+    """原子重命名且不覆盖已存在目标（跨平台）
+
+    Windows 的 os.rename 目标存在时抛 FileExistsError；
+    macOS/Linux 的 os.rename 会静默覆盖目标，因此改用
+    os.link（目标已存在时抛 FileExistsError，POSIX 原子）+ os.unlink。
+    跨分区时 os.link 抛 OSError(EXDEV)，交由调用方按失败处理。
+    """
+    if os.name == 'nt':
+        os.rename(src, dst)
+    else:
+        os.link(src, dst)
+        os.unlink(src)
 
 
 # Fixed column identifiers (not translated - used as internal Treeview column IDs)
@@ -55,6 +71,8 @@ class DateTab:
         self.rename_suffix.trace_add('write', self._on_rename_params_change_delayed)
         self.skip_files_with_date = tk.BooleanVar(value=True)
         self.files_to_process = []
+        # 预览/刷新重命名目标名时的存在性缓存（每次预览重建，worker 处理期间为 None）
+        self._name_exists_cache = None
 
         self.date_sort_column = None
         self.date_sort_reverse = False
@@ -75,6 +93,7 @@ class DateTab:
         self._lbl_suffix.config(text=_("后缀:"))
         self._chk_skip_date.config(text=_("文件名有日期跳过"))
         self.dry_run_check.config(text=_("试运行模式"))
+        self._chk_skip_existing.config(text=_("跳过已有拍摄日期的文件"))
         self._btn_clear.config(text=_("清空列表"))
         self._btn_export.config(text=_("导出结果"))
         self._preview_frame.config(text=_("文件预览"))
@@ -134,15 +153,17 @@ class DateTab:
         self.rename_frame.pack(side=tk.LEFT, padx=(20, 0))
         self._lbl_prefix = ttk.Label(self.rename_frame, text=_("前缀:"))
         self._lbl_prefix.pack(side=tk.LEFT)
-        ttk.Entry(self.rename_frame, textvariable=self.rename_prefix,
-                  width=8).pack(side=tk.LEFT, padx=(0, 5))
+        self._prefix_entry = ttk.Entry(self.rename_frame, textvariable=self.rename_prefix,
+                  width=8)
+        self._prefix_entry.pack(side=tk.LEFT, padx=(0, 5))
         self._lbl_date_label = ttk.Label(self.rename_frame, text=_("+拍摄日期+"),
                                relief='solid', borderwidth=1)
         self._lbl_date_label.pack(side=tk.LEFT, padx=(0, 5))
         self._lbl_suffix = ttk.Label(self.rename_frame, text=_("后缀:"))
         self._lbl_suffix.pack(side=tk.LEFT)
-        ttk.Entry(self.rename_frame, textvariable=self.rename_suffix,
-                  width=8).pack(side=tk.LEFT, padx=(0, 5))
+        self._suffix_entry = ttk.Entry(self.rename_frame, textvariable=self.rename_suffix,
+                  width=8)
+        self._suffix_entry.pack(side=tk.LEFT, padx=(0, 5))
         self._chk_skip_date = ttk.Checkbutton(self.rename_frame, text=_("文件名有日期跳过"),
                         variable=self.skip_files_with_date)
         self._chk_skip_date.pack(side=tk.LEFT, padx=(10, 0))
@@ -153,6 +174,10 @@ class DateTab:
         self.dry_run_check = ttk.Checkbutton(opts2_frame, text=_("试运行模式"),
                                               variable=self.dry_run)
         self.dry_run_check.pack(side=tk.LEFT, padx=(0, 10))
+        self._chk_skip_existing = ttk.Checkbutton(
+            opts2_frame, text=_("跳过已有拍摄日期的文件"),
+            variable=self.skip_existing)
+        self._chk_skip_existing.pack(side=tk.LEFT)
 
         btn_frame = ttk.Frame(self.frame)
         btn_frame.grid(row=2, column=0, columnspan=3, pady=(0, 2))
@@ -297,6 +322,14 @@ class DateTab:
                 return
 
     def _on_mode_change(self):
+        if getattr(self, '_processing', False):
+            # 处理中不允许切换模式，避免主线程改写 fi['status'] 与 worker 并发
+            messagebox.showwarning(_("警告"), _("正在处理中，请等待当前任务完成"))
+            return
+        if getattr(self, '_scanning', False):
+            # 扫描中同样禁止切换，避免扫描结果状态与当前 UI 模式不一致
+            messagebox.showwarning(_("警告"), _("正在扫描中，请等待扫描完成"))
+            return
         mode = self.operation_mode.get()
         if mode == "change_date":
             self.process_btn.config(text=_("开始更改日期"))
@@ -330,7 +363,7 @@ class DateTab:
             if mode == "change_date":
                 if existing is not None and existing != datetime.min:
                     fi['status'] = FileStatus.NO_DATE_NEEDED
-                elif fi.get('new_date') and fi['new_date'] != _('无法解析'):
+                elif fi.get('new_date'):
                     fi['status'] = FileStatus.PENDING_DATE_CHANGE
                 else:
                     fi['status'] = FileStatus.PARSE_FAILED
@@ -467,6 +500,9 @@ class DateTab:
         if getattr(self, '_processing', False):
             messagebox.showwarning(_("警告"), _("正在处理中，请等待当前任务完成"))
             return
+        if getattr(self, '_scanning', False):
+            messagebox.showwarning(_("警告"), _("正在扫描中，请等待扫描完成"))
+            return
         count = len(selected_items)
         if not messagebox.askyesno(_("确认删除"),
                                     _("确定要从处理序列中删除这 ") + str(count) + _(" 个文件吗？")):
@@ -476,16 +512,13 @@ class DateTab:
         for item_id in selected_items:
             values = self.date_tree.item(item_id, 'values')
             if values and len(values) >= 7:
-                tree_path = values[6]
-                for f in self.files_to_process:
-                    fp = str(f.get('path', ''))
-                    if fp == tree_path:
-                        items_to_remove.append(f)
-                        break
+                items_to_remove.append(values[6])
 
-        for f in items_to_remove:
-            if f in self.files_to_process:
-                self.files_to_process.remove(f)
+        # 路径映射查找，避免对每个选中行线性扫描 files_to_process（O(sel×n)）
+        path_to_f = {str(f.get('path', '')): f for f in self.files_to_process}
+        remove_paths = set(items_to_remove)
+        self.files_to_process[:] = [
+            f for f in self.files_to_process if str(f.get('path', '')) not in remove_paths]
 
         for item_id in selected_items:
             try:
@@ -502,6 +535,9 @@ class DateTab:
         if getattr(self, '_processing', False):
             messagebox.showwarning(_("警告"), _("正在处理中，请等待当前任务完成"))
             return
+        if getattr(self, '_scanning', False):
+            messagebox.showwarning(_("警告"), _("正在扫描中，请等待扫描完成"))
+            return
         count = len(selected_items)
         if count > 1:
             msg = _("确定要将这 ") + str(count) + _(" 个文件移至回收站吗？")
@@ -510,37 +546,44 @@ class DateTab:
         if not messagebox.askyesno(_("确认移至回收站"), msg):
             return
 
-        paths = []
-        for item_id in selected_items:
-            values = self.date_tree.item(item_id, 'values')
-            if values and len(values) >= 7:
-                paths.append(values[6])
+        # 全局互斥：防止与后台 GEO 写盘/处理并发时移动文件，避免写入截断损坏
+        if not self.app.acquire_processing():
+            messagebox.showwarning(_("警告"), _("其他任务正在处理中，请等待完成"), parent=self.app.root)
+            return
+        try:
+            paths = []
+            for item_id in selected_items:
+                values = self.date_tree.item(item_id, 'values')
+                if values and len(values) >= 7:
+                    paths.append(values[6])
 
-        success, failed = send_to_recycle_bin(paths)
-        failed_paths = set(f[0] for f in failed) if failed else set()
+            success, failed = send_to_recycle_bin(paths)
+            failed_paths = set(f[0] for f in failed) if failed else set()
 
-        for item_id in selected_items:
-            values = self.date_tree.item(item_id, 'values')
-            if values and len(values) >= 7:
-                tree_path = values[6]
-                if tree_path not in failed_paths:
-                    for f in self.files_to_process[:]:
-                        fp = str(f.get('path', ''))
-                        if fp == tree_path:
-                            self.files_to_process.remove(f)
-                            break
-                    try:
-                        self.date_tree.delete(item_id)
-                    except Exception:
-                        traceback.print_exc()
+            # O(n) 重建列表：避免对每个选中行线性扫描 files_to_process（O(sel×n)）
+            removed_paths = {tree_path for tree_path in paths if tree_path not in failed_paths}
+            self.files_to_process[:] = [
+                f for f in self.files_to_process
+                if str(f.get('path', '')) not in removed_paths]
 
-        self._update_preview()
-        self.status_var.set(_("已将 ") + str(success) + _(" 个文件移至回收站"))
-        self._append_log(_("已将 ") + str(success) + _(" 个文件移至回收站\n"))
-        if failed:
-            for name, err in failed:
-                self._append_log(_("失败: ") + name + " - " + err + "\n")
-        self._pulse_progress()
+            for item_id in selected_items:
+                values = self.date_tree.item(item_id, 'values')
+                if values and len(values) >= 7:
+                    if values[6] not in failed_paths:
+                        try:
+                            self.date_tree.delete(item_id)
+                        except Exception:
+                            traceback.print_exc()
+
+            self._update_preview()
+            self.status_var.set(_("已将 ") + str(success) + _(" 个文件移至回收站"))
+            self._append_log(_("已将 ") + str(success) + _(" 个文件移至回收站\n"))
+            if failed:
+                for name, err in failed:
+                    self._append_log(_("失败: ") + name + " - " + err + "\n")
+            self._pulse_progress()
+        finally:
+            self.app.release_processing()
 
     def _rename_single(self, file_info, item_id):
         if getattr(self, '_processing', False):
@@ -548,6 +591,16 @@ class DateTab:
             return
         if not file_info:
             return
+        # 全局互斥：防止与地理页后台 GPS 写盘等并发写同一文件导致损坏
+        if not self.app.acquire_processing():
+            messagebox.showwarning(_("警告"), _("其他任务正在处理中，请等待完成"))
+            return
+        try:
+            self._rename_single_locked(file_info, item_id)
+        finally:
+            self.app.release_processing()
+
+    def _rename_single_locked(self, file_info, item_id):
         current = file_info.get('filename', '')
         file_path = file_info.get('path', '')
         new_name = messagebox.askstring(_("重命名文件"),
@@ -583,7 +636,7 @@ class DateTab:
             return
 
         try:
-            os.rename(str(file_path), new_path)
+            _no_clobber_rename(str(file_path), new_path)
         except FileExistsError:
             messagebox.showerror(_("错误"), _("目标文件已存在: ") + new_name)
             return
@@ -627,51 +680,76 @@ class DateTab:
                 _("确定要对 ") + str(count) + _(" 个文件执行重命名操作吗？"),
                 parent=self.app.root):
             return
-        renamed = 0
-        total_rename = len(to_rename)
-        used_targets = set()
-        self.progress_var.set(0)
-        self.status_var.set(_("正在重命名... 0/") + str(total_rename))
-        for i, (fi, fp, new_fn) in enumerate(to_rename):
-            base_dir = os.path.dirname(fp)
-            orig_stem, ext = os.path.splitext(new_fn)
-            target = os.path.join(base_dir, new_fn)
-            counter = 1
-            # 同时检查批内已用目标和磁盘上真实存在的文件，避免覆盖
-            while (target in used_targets or os.path.exists(target)) and counter < 10000:
-                candidate = f"{orig_stem}_{counter:03d}{ext}"
-                target = os.path.join(base_dir, candidate)
-                counter += 1
-            if counter >= 10000:
-                self._append_log(_("重命名失败（无法生成唯一文件名）") + ": " + os.path.basename(fp) + " → " + new_fn + "\n")
-                continue
-            actual_new_fn = os.path.basename(target)
+        # 全局互斥：防止与地理页处理等其它任务同时写文件
+        if not self.app.acquire_processing():
+            messagebox.showwarning(_("警告"), _("其他任务正在处理中，请等待完成"))
+            return
+        self._processing = True
+        self._set_ui_processing_state(True)
+
+        def worker():
             try:
-                os.rename(fp, target)
-                fi['path'] = target
-                fi['filename'] = actual_new_fn
-                fi['status'] = FileStatus.MANUALLY_RENAMED
-                fi['manual_rename'] = True
-                self._append_log(_("已重命名") + ": " + os.path.basename(fp) + " → " + actual_new_fn + "\n")
-                used_targets.add(target)
-                if actual_new_fn != new_fn:
-                    self._append_log("  （" + _("原目标") + " " + new_fn + " " + _("已存在，自动使用") + " " + actual_new_fn + "）\n")
-                renamed += 1
-            except FileExistsError:
-                self._append_log(_("重命名失败（目标文件已存在）") + ": " + os.path.basename(fp) + " → " + new_fn + "\n")
-            except Exception as e:
-                self._append_log(_("重命名失败") + ": " + os.path.basename(fp) + " → " + str(e) + "\n")
-            self.progress_var.set((i + 1) / total_rename * 100)
-            self.status_var.set(_("正在重命名... ") + str(i + 1) + "/" + str(total_rename))
-            self.app.root.update_idletasks()
-        self._update_preview()
-        failed = total_rename - renamed
-        if renamed:
-            self.status_var.set(_("批量重命名完成，共重命名 ") + str(renamed) + _(" 个文件"))
-            msg = _("批量重命名完成\n成功: ") + str(renamed)
-            if failed:
-                msg += _("\n失败: ") + str(failed)
-            messagebox.showinfo(_("批量重命名"), msg, parent=self.app.root)
+                renamed = 0
+                total_rename = len(to_rename)
+                used_targets = set()
+                self.app.post_to_ui(lambda: self.progress_var.set(0))
+                self.app.post_to_ui(lambda t=total_rename: self.status_var.set(_("正在重命名... 0/") + str(t)))
+                for i, (fi, fp, new_fn) in enumerate(to_rename):
+                    base_dir = os.path.dirname(fp)
+                    orig_stem, ext = os.path.splitext(new_fn)
+                    target = os.path.join(base_dir, new_fn)
+                    counter = 1
+                    # 同时检查批内已用目标和磁盘上真实存在的文件，避免覆盖
+                    while (target in used_targets or os.path.exists(target)) and counter < 10000:
+                        candidate = f"{orig_stem}_{counter:03d}{ext}"
+                        target = os.path.join(base_dir, candidate)
+                        counter += 1
+                    if counter >= 10000:
+                        self.app.post_to_ui(lambda n=os.path.basename(fp), nf=new_fn: self._append_log(
+                            _("重命名失败（无法生成唯一文件名）") + ": " + n + " → " + nf + "\n"))
+                        continue
+                    actual_new_fn = os.path.basename(target)
+                    try:
+                        _no_clobber_rename(fp, target)
+                        fi['path'] = target
+                        fi['filename'] = actual_new_fn
+                        fi['status'] = FileStatus.MANUALLY_RENAMED
+                        fi['manual_rename'] = True
+                        self.app.post_to_ui(lambda n=os.path.basename(fp), an=actual_new_fn: self._append_log(
+                            _("已重命名") + ": " + n + " → " + an + "\n"))
+                        used_targets.add(target)
+                        if actual_new_fn != new_fn:
+                            self.app.post_to_ui(lambda an=actual_new_fn, o=new_fn: self._append_log(
+                                "  （" + _("原目标") + " " + o + " " + _("已存在，自动使用") + " " + an + "）\n"))
+                        renamed += 1
+                    except FileExistsError:
+                        self.app.post_to_ui(lambda n=os.path.basename(fp), nf=new_fn: self._append_log(
+                            _("重命名失败（目标文件已存在）") + ": " + n + " → " + nf + "\n"))
+                    except Exception as e:
+                        self.app.post_to_ui(lambda n=os.path.basename(fp), e=str(e): self._append_log(
+                            _("重命名失败") + ": " + n + " → " + e + "\n"))
+                    done = i + 1
+                    self.app.post_to_ui(lambda d=done, t=total_rename: (
+                        self.progress_var.set(d / t * 100),
+                        self.status_var.set(_("正在重命名... ") + str(d) + "/" + str(t))))
+                failed = total_rename - renamed
+                self.app.post_to_ui(self._update_preview)
+                self.app.post_to_ui(lambda r=renamed: self.status_var.set(
+                    _("批量重命名完成，共重命名 ") + str(r) + _(" 个文件")))
+                if renamed:
+                    msg = _("批量重命名完成\n成功: ") + str(renamed)
+                    if failed:
+                        msg += _("\n失败: ") + str(failed)
+                    self.app.post_to_ui(lambda m=msg: messagebox.showinfo(
+                        _("批量重命名"), m, parent=self.app.root))
+            finally:
+                self.app.post_to_ui(lambda: setattr(self, '_processing', False))
+                self.app.post_to_ui(lambda: self._set_ui_processing_state(False))
+                self.app.post_to_ui(self.app.release_processing)
+
+        thread = threading.Thread(target=worker, daemon=True)
+        self.app.register_thread(thread)
+        thread.start()
 
     def scan_files(self):
         folder = self.selected_directory.get()
@@ -680,6 +758,13 @@ class DateTab:
             return
         if getattr(self, '_scanning', False):
             return
+        if getattr(self, '_processing', False):
+            messagebox.showwarning(_("警告"), _("正在处理中，请等待当前任务完成"))
+            return
+        # 全局互斥：地理页等其它任务进行中时禁止启动
+        if not self.app.acquire_processing():
+            messagebox.showwarning(_("警告"), _("其他任务正在处理中，请等待完成"))
+            return
 
         self._scanning = True
         scan_mode = self.operation_mode.get()
@@ -687,93 +772,116 @@ class DateTab:
         thread = threading.Thread(
             target=self._scan_thread, args=(folder, scan_mode, scan_skip_with_date))
         thread.daemon = True
+        self.app.register_thread(thread)
         thread.start()
 
     def _scan_thread(self, folder, scan_mode, scan_skip_with_date):
         try:
-            self.app.root.after(0, lambda: self.status_var.set(_("正在扫描文件...")))
-            self.app.root.after(0, lambda: self.progress_var.set(0))
+            self.app.post_to_ui(lambda: self.status_var.set(_("正在扫描文件...")))
+            self.app.post_to_ui(lambda: self.progress_var.set(0))
 
-            files = []
+            # 第一阶段：先完整收集文件列表，确定总文件数，
+            # 避免边遍历边处理时总数未定导致进度条来回跳动
+            all_files = []
             for r, _dirs, fs in os.walk(folder):
                 for f in fs:
                     ext = os.path.splitext(f)[1].lower()
-                    if ext in ALL_MEDIA_EXTENSIONS:
-                        files.append(os.path.join(r, f))
-
-            total = len(files)
-            if total == 0:
-                self.app.root.after(0, lambda: self.status_var.set(_("未找到媒体文件")))
-                self.app.root.after(0, lambda: setattr(self, '_scanning', False))
-                return
-
-            def process_one(fp, mode=scan_mode, skip_with_date=scan_skip_with_date):
-                p = Path(fp)
-                parsed = parse_datetime_from_filename(p.name)
-                existing = get_existing_datetime(p)
-                if mode == "change_date":
-                    if existing and existing != datetime.min:
-                        status = FileStatus.NO_DATE_NEEDED
-                    elif parsed:
-                        status = FileStatus.PENDING_DATE_CHANGE
-                    else:
-                        status = FileStatus.PARSE_FAILED
-                else:
-                    if not existing or existing == datetime.min:
-                        status = FileStatus.SKIPPED
-                    elif skip_with_date and parsed:
-                        status = FileStatus.SKIPPED
-                    else:
-                        status = FileStatus.PENDING_RENAME
-
-                return {
-                    'path': str(p),
-                    'filename': p.name,
-                    'original_date': existing.strftime('%Y-%m-%d %H:%M:%S') if existing and existing != datetime.min else None,
-                    'new_date': parsed.strftime('%Y-%m-%d %H:%M:%S') if parsed else None,
-                    'status': status,
-                }
+                    if ext not in ALL_MEDIA_EXTENSIONS:
+                        continue
+                    all_files.append(os.path.join(r, f))
+            total = len(all_files)
 
             results = []
             with ThreadPoolExecutor(max_workers=min(32, (os.cpu_count() or 4) * 2)) as pool:
-                futs = [pool.submit(process_one, fp) for fp in files]
+                # 分块提交任务，避免一次性持有全部路径/任务对象导致内存峰值
+                pending = {}
                 count = 0
-                for fut in as_completed(futs):
-                    results.append(fut.result())
-                    count += 1
-                    if count % 10 == 0 or count == total:
-                        pct = count / total * 100
-                        self.app.root.after(0, lambda p=pct: self.progress_var.set(p))
-                        self.app.root.after(
-                            0, lambda c=count, t=total: self.status_var.set(
-                                _("正在扫描文件... ") + str(c) + "/" + str(t)))
 
-            self.app.root.after(0, lambda r=results: setattr(self, 'files_to_process', r))
-            self.app.root.after(0, self._update_preview)
-            self.app.root.after(
-                0, lambda r=results: self.status_var.set(
+                def _process_batch():
+                    nonlocal count
+                    for fut in as_completed(pending):
+                        fp = pending.pop(fut)
+                        try:
+                            results.append(fut.result())
+                        except Exception:
+                            traceback.print_exc()
+                        count += 1
+                        if count % 10 == 0 or count == total:
+                            pct = count / total * 100 if total else 100
+                            self.app.post_to_ui(lambda p=pct: self.progress_var.set(p))
+                            self.app.post_to_ui(
+                                lambda c=count, t=total: self.status_var.set(
+                                    _("正在扫描文件... ") + str(c) + "/" + str(t)))
+
+                def process_one(fp, mode=scan_mode, skip_with_date=scan_skip_with_date):
+                    p = Path(fp)
+                    parsed = parse_datetime_from_filename(p.name)
+                    # change_date 模式只依据 EXIF/QuickTime 日期判断，
+                    # 避免文件系统创建/修改时间兜底把无 EXIF 日期的文件误标为已有日期
+                    existing = get_existing_datetime(
+                        p, fallback_to_fs=(mode != "change_date"))
+                    if mode == "change_date":
+                        if existing and existing != datetime.min:
+                            status = FileStatus.NO_DATE_NEEDED
+                        elif parsed:
+                            status = FileStatus.PENDING_DATE_CHANGE
+                        else:
+                            status = FileStatus.PARSE_FAILED
+                    else:
+                        if not existing or existing == datetime.min:
+                            status = FileStatus.SKIPPED
+                        elif skip_with_date and parsed:
+                            status = FileStatus.SKIPPED
+                        else:
+                            status = FileStatus.PENDING_RENAME
+
+                    return {
+                        'path': str(p),
+                        'filename': p.name,
+                        'original_date': existing.strftime('%Y-%m-%d %H:%M:%S') if existing and existing != datetime.min else None,
+                        'new_date': parsed.strftime('%Y-%m-%d %H:%M:%S') if parsed else None,
+                        'status': status,
+                    }
+
+                for fp in all_files:
+                    pending[pool.submit(process_one, fp)] = fp
+                    if len(pending) >= 500:
+                        _process_batch()
+                if pending:
+                    _process_batch()
+
+            self.app.post_to_ui(lambda r=results: setattr(self, 'files_to_process', r))
+            self.app.post_to_ui(self._update_preview)
+            self.app.post_to_ui(
+                lambda r=results: self.status_var.set(
                     _("扫描完成，找到 ") + str(len(r)) + _(" 个文件")))
-            self.app.root.after(0, lambda: self.progress_var.set(100))
-            self.app.root.after(0, lambda r=results: self._append_log(
+            self.app.post_to_ui(lambda: self.progress_var.set(100))
+            self.app.post_to_ui(lambda r=results: self._append_log(
                 _("扫描完成，共找到 ") + str(len(r)) + _(" 个文件\n")))
-            self.app.root.after(0, lambda: setattr(self, '_scanning', False))
         except Exception:
             traceback.print_exc()
-            self.app.root.after(
-                0, lambda: self.status_var.set(_("扫描失败")))
-            self.app.root.after(
-                0, lambda: self._append_log(_("扫描失败\n")))
-            self.app.root.after(0, lambda: setattr(self, '_scanning', False))
+            self.app.post_to_ui(
+                lambda: self.status_var.set(_("扫描失败")))
+            self.app.post_to_ui(
+                lambda: self._append_log(_("扫描失败\n")))
+        finally:
+            self.app.post_to_ui(lambda: setattr(self, '_scanning', False))
+            self.app.post_to_ui(self.app.release_processing)
 
     def _update_preview(self):
-        for item in self.date_tree.get_children():
-            self.date_tree.delete(item)
+        # 批量删除所有行，避免每个 item 一次 Tcl 往返
+        children = self.date_tree.get_children()
+        if children:
+            self.date_tree.delete(*children)
 
+        # 本预览周期内复用候选目标名的存在性判断，避免主线程逐行重复 stat
+        self._name_exists_cache = {}
         sorted_files = sorted(
             self.files_to_process,
             key=lambda x: x.get('original_date', '') if x.get('original_date') is not None else '9999-12-31 23:59:59')
 
-        for fi in sorted_files:
+        rename_mode = self.operation_mode.get() == "rename_file"
+        for i, fi in enumerate(sorted_files, start=1):
             filename = fi.get('filename', '')
             orig_date = fi.get('original_date') or _('无')
             new_date = fi.get('new_date') if fi.get('new_date') else _('无法解析')
@@ -781,7 +889,7 @@ class DateTab:
             file_path = fi.get('path', '')
             new_filename = ''
 
-            if self.operation_mode.get() == "rename_file":
+            if rename_mode:
                 # 复用扫描时缓存的 original_date，避免主线程逐文件重读 EXIF 卡顿
                 existing = None
                 cached = fi.get('original_date')
@@ -797,7 +905,8 @@ class DateTab:
                         new_filename = _('原文件名有日期')
                 else:
                     if existing and existing != datetime.min:
-                        new_filename = self._gen_new_name(file_path, existing, fi)
+                        new_filename = self._gen_new_name(file_path, existing, fi,
+                                                          exists_cache=self._name_exists_cache)
                         if new_filename is None:
                             if fi.get('manual_rename'):
                                 new_filename = _('已手动重命名')
@@ -807,18 +916,13 @@ class DateTab:
                         new_filename = _('无拍摄日期')
 
             display_status = status_text(st, fi.get('status_detail', ''))
-            if self.operation_mode.get() == "rename_file":
+            if rename_mode:
                 item_id = self.date_tree.insert('', tk.END, values=(
-                    '', filename, orig_date, '', new_filename, display_status, str(fi.get('path', ''))))
+                    str(i), filename, orig_date, '', new_filename, display_status, str(fi.get('path', ''))))
             else:
                 item_id = self.date_tree.insert('', tk.END, values=(
-                    '', filename, orig_date, new_date, '', display_status, str(fi.get('path', ''))))
+                    str(i), filename, orig_date, new_date, '', display_status, str(fi.get('path', ''))))
             fi['_tree_id'] = item_id
-
-        for i, item in enumerate(self.date_tree.get_children()):
-            values = list(self.date_tree.item(item, 'values'))
-            values[0] = i + 1
-            self.date_tree.item(item, values=tuple(values))
 
     def _update_preview_row(self, fi):
         item_id = fi.get('_tree_id')
@@ -845,6 +949,11 @@ class DateTab:
     def _refresh_new_filenames(self):
         if self.operation_mode.get() != "rename_file":
             return
+        # 处理期间 worker 对磁盘进行重命名，此时重算预览既卡主线程又与 worker 快照不一致
+        if getattr(self, '_processing', False):
+            return
+        # 本刷新周期内复用候选目标名的存在性判断
+        self._name_exists_cache = {}
         for fi in self.files_to_process:
             item_id = fi.get('_tree_id')
             if not item_id or not self.date_tree.exists(item_id):
@@ -862,7 +971,8 @@ class DateTab:
                     new_fn = _('无拍摄日期')
                 else:
                     fp = fi.get('path', '')
-                    new_name = self._gen_new_name(fp, dt, fi)
+                    new_name = self._gen_new_name(fp, dt, fi,
+                                                  exists_cache=self._name_exists_cache)
                     if new_name is None:
                         new_fn = _('已手动重命名') if fi.get('manual_rename') else _('与原文件名相同')
                     else:
@@ -873,7 +983,7 @@ class DateTab:
                 self.date_tree.item(item_id, values=tuple(values))
 
     def _gen_new_name(self, original_path, date_to_use, file_info=None,
-                       prefix=None, suffix=None):
+                       prefix=None, suffix=None, exists_cache=None):
         if file_info and file_info.get('manual_rename'):
             return None
         ext = os.path.splitext(original_path)[1]
@@ -892,7 +1002,7 @@ class DateTab:
         if base_new_name == orig_name:
             return None
 
-        if not os.path.exists(os.path.join(base_dir, base_new_name)):
+        if not self._path_exists(os.path.join(base_dir, base_new_name), exists_cache):
             return base_new_name
 
         counter = 1
@@ -900,10 +1010,21 @@ class DateTab:
             candidate = f"{prefix}{date_str}{suffix}_{counter:03d}{ext}"
             if candidate == orig_name:
                 return None
-            if not os.path.exists(os.path.join(base_dir, candidate)):
+            if not self._path_exists(os.path.join(base_dir, candidate), exists_cache):
                 return candidate
             counter += 1
         return None
+
+    def _path_exists(self, path, cache):
+        """带可选缓存的 os.path.exists：预览路径复用同一次刷新的判断结果，
+        避免主线程对同一目标名重复 stat（worker 处理路径传入 None 保持实时判断）。"""
+        if cache is None:
+            return os.path.exists(path)
+        if path in cache:
+            return cache[path]
+        exists = os.path.exists(path)
+        cache[path] = exists
+        return exists
 
     def _sort_tree(self, column):
         if column == '序号':
@@ -919,29 +1040,62 @@ class DateTab:
 
         col_idx = _DATE_COL_IDS.index(column)
 
-        def sort_key(item):
-            values = self.date_tree.item(item, 'values')
-            if not values or len(values) <= col_idx:
-                return ""
-            val = values[col_idx]
-            if column == '文件拍摄日期':
-                try:
-                    return datetime.strptime(val, '%Y-%m-%d %H:%M:%S')
-                except Exception:
-                    return datetime(9999, 12, 31)
-            if column == '状态':
-                for fi in self.files_to_process:
-                    if fi.get('_tree_id') == item:
-                        return status_sort_key(fi.get('status'))
-                return 999
-            return val.lower() if isinstance(val, str) else str(val)
+        # 预构建 _tree_id -> fi 映射（避免状态列对每个树行线性遍历 files_to_process O(n²)）
+        tid_map = {fi.get('_tree_id'): fi for fi in self.files_to_process if fi.get('_tree_id')}
 
-        items.sort(key=sort_key, reverse=self.date_sort_reverse)
+        # 每行排序键与显示值一次性预计算，避免 sort_key 中反复调用 tree.item()/strptime。
+        # 'YYYY-MM-DD HH:MM:SS' 字符串可按字典序直接比较，无需解析为 datetime。
+        no_date = '9999-12-31 23:59:59'
+        key_map = {}
+        values_map = {}
+        selected = set(self.date_tree.selection())
+        selected_paths = set()
+        for item in items:
+            values = self.date_tree.item(item, 'values')
+            values_map[item] = values
+            if item in selected and values and len(values) >= 7:
+                selected_paths.add(values[6])
+            if column == '状态':
+                fi = tid_map.get(item)
+                key_map[item] = status_sort_key(fi.get('status')) if fi is not None else 999
+            elif column == '文件拍摄日期':
+                fi = tid_map.get(item)
+                raw = fi.get('original_date') if fi is not None else None
+                key_map[item] = raw if raw else no_date
+            else:
+                val = values[col_idx] if values and len(values) > col_idx else ""
+                key_map[item] = val.lower() if isinstance(val, str) else str(val)
+
+        items.sort(key=lambda it: key_map[it], reverse=self.date_sort_reverse)
+
+        # 重建树而不是逐行 move：move 对每行一次 Tcl 往返，大列表时极慢。
+        # 一次性删除全部行，再按排序结果顺序重建（序号在插入时直接写入，
+        # 省掉原来第二遍读值改序号的遍历）。重建后 item id 全部变化，
+        # 需同步更新各 fi['_tree_id']，保证双击/右键/增量刷新仍能定位。
+        try:
+            yview_frac = self.date_tree.yview()[0]
+        except Exception:
+            yview_frac = 0.0
+        self.date_tree.delete(*items)
+        new_ids = {}
         for i, item in enumerate(items):
-            self.date_tree.move(item, '', i)
-            values = list(self.date_tree.item(item, 'values'))
-            values[0] = i + 1
-            self.date_tree.item(item, values=tuple(values))
+            values = list(values_map.get(item) or [])
+            if len(values) < 7:
+                values = [str(i + 1), '', '', '', '', '', '']
+            else:
+                values[0] = i + 1
+            new_id = self.date_tree.insert('', tk.END, values=tuple(values))
+            new_ids[item] = new_id
+            if values[6] in selected_paths:
+                self.date_tree.selection_add(new_id)
+        for old_id, new_id in new_ids.items():
+            fi = tid_map.get(old_id)
+            if fi is not None:
+                fi['_tree_id'] = new_id
+        try:
+            self.date_tree.yview_moveto(yview_frac)
+        except Exception:
+            pass
         self._update_sort_indicators()
 
     def _update_sort_indicators(self):
@@ -957,8 +1111,15 @@ class DateTab:
         if getattr(self, '_processing', False):
             messagebox.showwarning(_("警告"), _("正在处理中，请等待当前任务完成"))
             return
+        if getattr(self, '_scanning', False):
+            messagebox.showwarning(_("警告"), _("正在扫描中，请等待扫描完成"))
+            return
         if not self.files_to_process:
             messagebox.showwarning(_("警告"), _("请先扫描文件"))
+            return
+        # 全局互斥：地理页等其它任务进行中时禁止启动
+        if not self.app.acquire_processing():
+            messagebox.showwarning(_("警告"), _("其他任务正在处理中，请等待完成"))
             return
         self._processing = True
         dry_run = self.dry_run.get()
@@ -973,13 +1134,23 @@ class DateTab:
             args=(dry_run, operation_mode, skip_existing,
                   rename_prefix_val, rename_suffix_val))
         thread.daemon = True
+        self.app.register_thread(thread)
         thread.start()
 
     def _set_ui_processing_state(self, disabled):
         state = "disabled" if disabled else "normal"
-        self.app.root.after(0, lambda: self.process_btn.config(state=state))
-        self.app.root.after(0, lambda: self.scan_btn.config(state=state))
-        self.app.root.after(0, lambda: self.dry_run_check.config(state=state))
+        self.app.post_to_ui(lambda: self.process_btn.config(state=state))
+        self.app.post_to_ui(lambda: self.scan_btn.config(state=state))
+        self.app.post_to_ui(lambda: self.dry_run_check.config(state=state))
+        # 处理期间禁用模式单选按钮，防止 _refilter_files_for_mode 与 worker 并发改写状态
+        self.app.post_to_ui(lambda: self._rb_change_date.config(state=state))
+        self.app.post_to_ui(lambda: self._rb_rename.config(state=state))
+        # 处理期间禁用重命名前缀/后缀输入框：worker 已快照其值，
+        # 改动会导致预览与实际结果不一致，并在主线程触发全表重算
+        for _entry in (getattr(self, '_prefix_entry', None),
+                       getattr(self, '_suffix_entry', None)):
+            if _entry is not None:
+                self.app.post_to_ui(lambda e=_entry: e.config(state=state))
 
     def _get_eligible_files(self, operation_mode):
         files_copy = list(self.files_to_process)
@@ -999,18 +1170,22 @@ class DateTab:
         return files_copy, to_process
 
     def _handle_no_files_to_process(self, total):
-        self.app.root.after(0, lambda: self.status_var.set(_("处理完成（没有需要处理的文件）")))
-        self.app.root.after(0, lambda: self._append_log(
+        self.app.post_to_ui(lambda: self.status_var.set(_("处理完成（没有需要处理的文件）")))
+        self.app.post_to_ui(lambda: self._append_log(
             "\n" + _("处理完成") + "！\n" + _("成功: ") + "0\n" + _("跳过: ") + str(total) + "\n" + _("失败: ") + "0\n"))
-        self.app.root.after(0, lambda: CompletionDialog(self.app.root, 0, total, 0))
+        self.app.post_to_ui(lambda: CompletionDialog(self.app.root, 0, total, 0))
 
     def _process_single_file_change_date(self, fi, dry_run, skip_existing):
         if not dry_run:
-            ok, msg = self.date_renamer.process_file(
+            ok, msg, skipped = self.date_renamer.process_file(
                 fi['path'], skip_existing=skip_existing)
             if ok:
-                fi['status'] = FileStatus.DATE_CHANGED
-                fi['original_date'] = fi.get('new_date', None)
+                if skipped:
+                    # 跳过不等于成功：不标 DATE_CHANGED、不覆盖 original_date
+                    fi['status'] = FileStatus.NO_DATE_NEEDED
+                else:
+                    fi['status'] = FileStatus.DATE_CHANGED
+                    fi['original_date'] = fi.get('new_date', None)
             else:
                 fi['status'] = FileStatus.FAILED
                 fi['status_detail'] = msg
@@ -1037,10 +1212,32 @@ class DateTab:
                         fi['status'] = FileStatus.FAILED
                         fi['status_detail'] = _("目标文件已存在: ") + new_name
                         return
-                    os.rename(fp, new_path)
+                    # 多 worker 并发下 exists→rename 存在 TOCTOU 竞态：
+                    # 目标被其它 worker 抢占时立即改用编号名重试，避免整个文件失败
+                    base_dir = os.path.dirname(fp)
+                    orig_stem, ext = os.path.splitext(new_name)
+                    target = new_path
+                    counter = 1
+                    renamed_to = None
+                    while True:
+                        try:
+                            _no_clobber_rename(fp, target)
+                            renamed_to = os.path.basename(target)
+                            break
+                        except FileExistsError:
+                            if counter >= 10000:
+                                break
+                            target = os.path.join(base_dir, f"{orig_stem}_{counter:03d}{ext}")
+                            counter += 1
+                        except OSError:
+                            break
+                    if renamed_to is None:
+                        fi['status'] = FileStatus.FAILED
+                        fi['status_detail'] = _("目标文件已存在: ") + new_name
+                        return
                     fi['status'] = FileStatus.RENAMED
-                    fi['filename'] = new_name
-                    fi['path'] = new_path
+                    fi['filename'] = renamed_to
+                    fi['path'] = target
                 else:
                     fi['status'] = FileStatus.DRY_RUN
                     fi['status_detail'] = new_name
@@ -1071,6 +1268,7 @@ class DateTab:
                             rename_prefix_val, rename_suffix_val):
         lock = threading.Lock()
         max_workers = min(32, (os.cpu_count() or 4) * 2)
+        prev_failed_ids = None
         for retry_round in range(5):
             done = 0
             total_to_process = len(to_process)
@@ -1078,7 +1276,7 @@ class DateTab:
                 break
             if retry_round > 0:
                 time.sleep(0.5 * retry_round ** 2)
-                self.app.root.after(0, lambda r=retry_round, c=len(to_process): (
+                self.app.post_to_ui(lambda r=retry_round, c=len(to_process): (
                     self.status_var.set(_("重试第 ") + str(r) + _(" 轮, 剩余 ") + str(c) + _(" 个文件..."))))
 
             with ThreadPoolExecutor(max_workers=max_workers) as pool:
@@ -1091,21 +1289,29 @@ class DateTab:
                     fut.result()
                     with lock:
                         done += 1
-                    self.app.root.after(0, lambda f=fi: self._update_preview_row(f))
+                    # 节流：每 5 个文件刷新一行，避免万级文件排队大量 Tk 回调
+                    if done % 5 == 0 or done == total_to_process:
+                        self.app.post_to_ui(lambda f=fi: self._update_preview_row(f))
                     if done % 5 == 0 or done == total_to_process:
                         pct = done / total_to_process * 100
-                        self.app.root.after(0, lambda p=pct, d=done, t=total_to_process: (
+                        self.app.post_to_ui(lambda p=pct, d=done, t=total_to_process: (
                             self.progress_var.set(p),
                             self.status_var.set(_("进度: ") + str(d) + "/" + str(t))))
 
             if retry_round < 4:
                 to_process = [fi for fi in to_process if fi.get('status') == FileStatus.FAILED]
+                new_ids = {id(fi) for fi in to_process}
+                # 连续两轮失败文件集合完全相同说明失败是永久性的（权限/目录只读/格式不支持等），
+                # 继续重试只会空耗时间，提前结束
+                if prev_failed_ids is not None and new_ids == prev_failed_ids:
+                    break
+                prev_failed_ids = new_ids
         return to_process
 
     def _process_thread(self, dry_run, operation_mode, skip_existing,
                         rename_prefix_val='', rename_suffix_val=''):
         try:
-            self.app.root.after(0, lambda: self.status_var.set(_("处理中...")))
+            self.app.post_to_ui(lambda: self.status_var.set(_("处理中...")))
             self._set_ui_processing_state(True)
 
             files_copy, to_process = self._get_eligible_files(operation_mode)
@@ -1115,31 +1321,34 @@ class DateTab:
                 self._handle_no_files_to_process(total)
                 return
 
-            self.app.root.after(0, lambda: self.progress_var.set(0))
+            self.app.post_to_ui(lambda: self.progress_var.set(0))
             self._execute_retry_loop(to_process, operation_mode, dry_run,
                                      skip_existing, rename_prefix_val, rename_suffix_val)
 
-            self.app.root.after(0, lambda: self.progress_var.set(100))
-            self.app.root.after(0, lambda: self.status_var.set(_("处理完成")))
+            self.app.post_to_ui(lambda: self.progress_var.set(100))
+            self.app.post_to_ui(lambda: self.status_var.set(_("处理完成")))
+            # 兜底刷新预览，保证节流跳过的行最终一致
+            self.app.post_to_ui(self._update_preview)
 
             final_success = sum(1 for fi in self.files_to_process
                                 if fi.get('status') in (FileStatus.DATE_CHANGED, FileStatus.RENAMED,
                                                          FileStatus.DRY_RUN, FileStatus.DRY_RUN_DATE_CHANGED))
             final_failed = sum(1 for fi in self.files_to_process if fi.get('status') == FileStatus.FAILED)
             final_skipped = total - final_success - final_failed
-            self.app.root.after(
-                0, lambda: self._append_log(
+            self.app.post_to_ui(
+                lambda: self._append_log(
                     "\n" + _("处理完成") + "！\n" + _("成功: ") + str(final_success) +
                     _("\n跳过: ") + str(final_skipped) + _("\n失败: ") + str(final_failed) + "\n"))
-            self.app.root.after(
-                0, lambda s=final_success, k=final_skipped, f=final_failed:
+            self.app.post_to_ui(
+                lambda s=final_success, k=final_skipped, f=final_failed:
                     CompletionDialog(self.app.root, s, k, f))
         except Exception:
             traceback.print_exc()
-            self.app.root.after(0, lambda: self.status_var.set(_("处理失败")))
+            self.app.post_to_ui(lambda: self.status_var.set(_("处理失败")))
         finally:
             self._set_ui_processing_state(False)
-            self.app.root.after(0, lambda: setattr(self, '_processing', False))
+            self.app.post_to_ui(lambda: setattr(self, '_processing', False))
+            self.app.post_to_ui(self.app.release_processing)
 
     def _pulse_progress(self):
         self.progress.config(mode='determinate')
@@ -1158,6 +1367,9 @@ class DateTab:
     def clear_list(self):
         if getattr(self, '_processing', False):
             messagebox.showwarning(_("警告"), _("正在处理中，请等待当前任务完成"))
+            return
+        if getattr(self, '_scanning', False):
+            messagebox.showwarning(_("警告"), _("正在扫描中，请等待扫描完成"))
             return
         self.files_to_process = []
         self._update_preview()
@@ -1225,6 +1437,14 @@ class DateTab:
 
         if not messagebox.askyesno(_("确认批量修改"), detail, parent=self.app.root):
             return
+        # 全局互斥：防止与地理页处理同时写文件
+        if not self.app.acquire_processing():
+            messagebox.showwarning(_("警告"), _("其他任务正在处理中，请等待完成"))
+            return
+        # 与 _batch_rename_items 一致：置位 _processing 并禁用 UI，
+        # 防止 worker 写 fi 状态与主线程模式切换/右键操作互相覆盖
+        self._processing = True
+        self._set_ui_processing_state(True)
 
         def process_one(fi):
             try:
@@ -1242,19 +1462,19 @@ class DateTab:
 
         def process():
             try:
-                self.app.root.after(0, lambda: self.log_text.config(state='normal'))
-                self.app.root.after(0, lambda: self.log_text.insert(tk.END,
+                self.app.post_to_ui(lambda: self.log_text.config(state='normal'))
+                self.app.post_to_ui(lambda: self.log_text.insert(tk.END,
                     _("批量修改拍摄日期") + "：" + _("共选择 ") + str(len(selected_items)) + _(" 个文件，")
                     + _("符合条件 ") + str(len(files_to_process)) + _(" 个\n")))
                 if skipped_already:
-                    self.app.root.after(0, lambda: self.log_text.insert(tk.END,
+                    self.app.post_to_ui(lambda: self.log_text.insert(tk.END,
                         _("跳过已有拍摄日期的文件") + "：" + str(len(skipped_already)) + _(" 个\n")))
                 if skipped_no_date:
-                    self.app.root.after(0, lambda: self.log_text.insert(tk.END,
+                    self.app.post_to_ui(lambda: self.log_text.insert(tk.END,
                         _("跳过无法解析日期的文件") + "：" + str(len(skipped_no_date)) + _(" 个\n")))
-                self.app.root.after(0, lambda: self.log_text.see(tk.END))
-                self.app.root.after(0, lambda: self.progress_var.set(0))
-                self.app.root.after(0, lambda: self.status_var.set(
+                self.app.post_to_ui(lambda: self.log_text.see(tk.END))
+                self.app.post_to_ui(lambda: self.progress_var.set(0))
+                self.app.post_to_ui(lambda: self.status_var.set(
                     _("进度: 0/") + str(len(files_to_process))))
 
                 total = len(files_to_process)
@@ -1274,13 +1494,14 @@ class DateTab:
                             if err:
                                 errors.append(err)
                         done += 1
-                        self.app.root.after(0, lambda d=done, t=total: (
-                            self.progress_var.set(d / t * 100),
-                            self.status_var.set(_("进度: ") + str(d) + "/" + str(t))
-                        ))
+                        if done % 5 == 0 or done == total:
+                            self.app.post_to_ui(lambda d=done, t=total: (
+                                self.progress_var.set(d / t * 100),
+                                self.status_var.set(_("进度: ") + str(d) + "/" + str(t))
+                            ))
 
-                self.app.root.after(0, self._update_preview)
-                self.app.root.after(0, lambda: (
+                self.app.post_to_ui(self._update_preview)
+                self.app.post_to_ui(lambda: (
                     self.log_text.config(state='normal'),
                     self.log_text.insert(tk.END,
                         _("批量编辑完成！\n成功: ") + str(success) + _(" 个, 失败: ") + str(failed) + _(" 个\n")
@@ -1290,20 +1511,32 @@ class DateTab:
                     self.progress_var.set(100),
                     self.status_var.set(_("进度: ") + str(total) + "/" + str(total))
                 ))
-                self.app.root.after(0, lambda s=success, f=failed, sk=len(skipped_already) + len(skipped_no_date): (
+                self.app.post_to_ui(lambda s=success, f=failed, sk=len(skipped_already) + len(skipped_no_date): (
                     self.status_var.set(_("进度: ") + str(s + f) + "/" + str(s + f) + _(" 成功: ") + str(s) + _(" 失败: ") + str(f) + _(" 跳过: ") + str(sk))
                 ))
             except Exception as e:
-                self.app.root.after(0, lambda: (
+                # 显式绑定 e，避免延迟执行的 lambda 中引用已删除的异常变量
+                self.app.post_to_ui(lambda e=e: (
                     self.log_text.config(state='normal'),
                     self.log_text.insert(tk.END, _("处理失败") + ": " + str(e) + "\n"),
                     self.log_text.see(tk.END),
                     self.log_text.config(state='disabled')))
+            finally:
+                self.app.post_to_ui(lambda: setattr(self, '_processing', False))
+                self.app.post_to_ui(lambda: self._set_ui_processing_state(False))
+                self.app.post_to_ui(self.app.release_processing)
 
         t = threading.Thread(target=process, daemon=True)
+        self.app.register_thread(t)
         t.start()
 
     def export_results(self):
+        if getattr(self, '_processing', False):
+            messagebox.showwarning(_("警告"), _("正在处理中，请等待当前任务完成"))
+            return
+        if getattr(self, '_scanning', False):
+            messagebox.showwarning(_("警告"), _("正在扫描中，请等待扫描完成"))
+            return
         if not self.files_to_process:
             messagebox.showwarning(_("警告"), _("没有可导出的数据"))
             return
@@ -1324,8 +1557,8 @@ class DateTab:
                     f.write("=" * 60 + "\n\n")
                     for i, fi in enumerate(self.files_to_process, 1):
                         f.write(f"{i}. {fi.get('filename', '')}\n")
-                        f.write(_("   拍摄日期: ") + fi.get('original_date', '') + "\n")
-                        f.write(_("   文件名日期: ") + fi.get('new_date', '') + "\n")
+                        f.write(_("   拍摄日期: ") + (fi.get('original_date') or '') + "\n")
+                        f.write(_("   文件名日期: ") + (fi.get('new_date') or '') + "\n")
                         f.write(_("   状态: ") + status_text(fi.get('status'), fi.get('status_detail', '')) + "\n")
                         f.write("-" * 40 + "\n")
             else:
@@ -1334,10 +1567,10 @@ class DateTab:
                     w.writerow([_('文件名'), _('文件路径'), _('拍摄时间'), _('文件名日期'), _('状态'), _('操作模式')])
                     for fi in self.files_to_process:
                         w.writerow([
-                            fi.get('filename', ''),
-                            str(fi.get('path', '')),
-                            fi.get('original_date', ''),
-                            fi.get('new_date', ''),
+                            csv_safe(fi.get('filename', '')),
+                            csv_safe(str(fi.get('path', ''))),
+                            fi.get('original_date') or '',
+                            fi.get('new_date') or '',
                             status_text(fi.get('status'), fi.get('status_detail', '')),
                             getattr(self, '_export_mode', self.operation_mode.get()),
                         ])

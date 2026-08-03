@@ -8,12 +8,25 @@ from collections.abc import Mapping
 
 from utils.gpx_utils import create_gpx_element, prettify_xml
 from utils.i18n import _
+from utils.media_utils import format_gps_coord
 
 
 def _get_val(item, key, default=None):
     if isinstance(item, Mapping):
         return item.get(key, default)
     return getattr(item, key, default)
+
+
+def csv_safe(value):
+    """CSV 单元格防公式注入：以 = + - @ 开头的值加单引号前缀
+
+    Excel 等表格软件会把这类单元格当作公式执行（如 =cmd|... ），
+    文件名/路径等用户可控内容必须经过此处理。
+    """
+    s = str(value)
+    if s.startswith(('=', '+', '-', '@')):
+        return "'" + s
+    return s
 
 
 def export_to_txt(filepath, a_list, b_list, gps_data, stats_text):
@@ -43,7 +56,7 @@ def export_to_txt(filepath, a_list, b_list, gps_data, stats_text):
                 f.write(_("   时间: ") + time_str + "\n")
                 lat, lon = _get_val(point, 'latitude'), _get_val(point, 'longitude')
                 if lat is not None and lon is not None:
-                    f.write(_("   位置: ") + f"({lat:.6f}, {lon:.6f})")
+                    f.write(_("   位置: ") + f"({lat:.8f}, {lon:.8f})")
                     alt = _get_val(point, 'altitude')
                     if alt is not None:
                         f.write(f", " + _("高度: ") + f"{alt:.2f}m")
@@ -64,7 +77,7 @@ def _write_file_info_txt(f, i, item):
     time_str = dt.strftime('%Y-%m-%d %H:%M:%S') if dt and dt != datetime.min else _('未知时间')
     f.write(_("   时间: ") + time_str + "\n")
     if lat is not None and lon is not None:
-        f.write(_("   位置: ") + f"({lat:.6f}, {lon:.6f})")
+        f.write(_("   位置: ") + f"({lat:.8f}, {lon:.8f})")
         if alt is not None:
             f.write(f", " + _("高度: ") + f"{alt:.2f}m")
         f.write("\n")
@@ -91,17 +104,22 @@ def export_to_csv(filepath, a_list, b_list):
             path = _get_val(item, 'path', '')
 
             time_str = dt.strftime('%Y-%m-%d %H:%M:%S') if dt and dt != datetime.min else ''
-            lat_str = lat if lat is not None else ''
-            lon_str = lon if lon is not None else ''
-            alt_str = alt if alt is not None else ''
+            # 用固定小数位格式化，避免 float 读回值出现 35.420289999999994 这类长尾
+            lat_str = format_gps_coord(lat) if lat is not None else ''
+            lon_str = format_gps_coord(lon) if lon is not None else ''
+            alt_str = format_gps_coord(alt) if alt is not None else ''
             size_str = f"{fsize / (1024 * 1024):.2f}" if fsize is not None else ''
             has_loc = _('是') if (lat is not None and lon is not None) else _('否')
 
-            writer.writerow([filename, path, time_str,
+            writer.writerow([csv_safe(filename), csv_safe(path), time_str,
                            lat_str, lon_str, alt_str, size_str, has_loc])
 
 
 def export_to_json(filepath, a_list, b_list, gps_data):
+    def _rc(v, n=8):
+        """坐标/高度取整到指定小数位，消除 float 读回长尾（如 35.420289999999994）"""
+        return None if v is None else round(v, n)
+
     export_data = {
         'export_info': {
             'timestamp': datetime.now().isoformat(),
@@ -121,9 +139,9 @@ def export_to_json(filepath, a_list, b_list, gps_data):
             'filename': _get_val(item, 'filename', ''),
             'path': _get_val(item, 'path', ''),
             'datetime': dt.isoformat() if dt and dt != datetime.min else None,
-            'latitude': _get_val(item, 'latitude'),
-            'longitude': _get_val(item, 'longitude'),
-            'altitude': _get_val(item, 'altitude'),
+            'latitude': _rc(_get_val(item, 'latitude')),
+            'longitude': _rc(_get_val(item, 'longitude')),
+            'altitude': _rc(_get_val(item, 'altitude'), 2),
             'file_size': _get_val(item, 'file_size'),
         })
 
@@ -133,9 +151,9 @@ def export_to_json(filepath, a_list, b_list, gps_data):
             'filename': _get_val(item, 'filename', ''),
             'path': _get_val(item, 'path', ''),
             'datetime': dt.isoformat() if dt and dt != datetime.min else None,
-            'latitude': _get_val(item, 'latitude'),
-            'longitude': _get_val(item, 'longitude'),
-            'altitude': _get_val(item, 'altitude'),
+            'latitude': _rc(_get_val(item, 'latitude')),
+            'longitude': _rc(_get_val(item, 'longitude')),
+            'altitude': _rc(_get_val(item, 'altitude'), 2),
             'file_size': _get_val(item, 'file_size'),
         })
 
@@ -144,19 +162,25 @@ def export_to_json(filepath, a_list, b_list, gps_data):
             if isinstance(point, dict):
                 export_data['gps_track_data'].append({
                     'datetime': point['datetime'].isoformat() if point['datetime'] else None,
-                    'latitude': point['latitude'],
-                    'longitude': point['longitude'],
-                    'altitude': point['altitude'],
+                    'latitude': _rc(point['latitude']),
+                    'longitude': _rc(point['longitude']),
+                    'altitude': _rc(point.get('altitude'), 2),
                     'source_file': point.get('source_file'),
                 })
             else:
-                export_data['gps_track_data'].append(point.to_dict())
+                d = point.to_dict()
+                d['latitude'] = _rc(d.get('latitude'))
+                d['longitude'] = _rc(d.get('longitude'))
+                d['altitude'] = _rc(d.get('altitude'), 2)
+                # 对象分支的 datetime 需显式转 ISO 字符串，否则 json.dump 抛 TypeError
+                d['datetime'] = d['datetime'].isoformat() if d.get('datetime') else None
+                export_data['gps_track_data'].append(d)
 
     with open(filepath, 'w', encoding='utf-8', newline='') as f:
         json.dump(export_data, f, ensure_ascii=False, indent=2)
 
 
-def export_to_gpx(filepath, a_list, gps_data):
+def export_to_gpx(filepath, a_list):
     points = []
     for item in a_list:
         points.append({
@@ -234,8 +258,8 @@ def generate_statistics(a_list, b_list, gps_data,
 
     if lats and lons:
         stats += "\n" + _("位置信息分析:") + "\n"
-        stats += INDENT + _("纬度范围: ") + f"{min(lats):.6f}" + _(" 到 ") + f"{max(lats):.6f}\n"
-        stats += INDENT + _("经度范围: ") + f"{min(lons):.6f}" + _(" 到 ") + f"{max(lons):.6f}\n"
+        stats += INDENT + _("纬度范围: ") + f"{min(lats):.8f}" + _(" 到 ") + f"{max(lats):.8f}\n"
+        stats += INDENT + _("经度范围: ") + f"{min(lons):.8f}" + _(" 到 ") + f"{max(lons):.8f}\n"
         if alts:
             stats += INDENT + _("高度范围: ") + f"{min(alts):.2f}" + _(" 到 ") + f"{max(alts):.2f}\n"
             stats += INDENT + _("平均高度: ") + f"{sum(alts) / len(alts):.2f}\n"

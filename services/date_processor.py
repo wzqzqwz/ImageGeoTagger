@@ -10,7 +10,9 @@
 from datetime import datetime
 from pathlib import Path
 
-from config import IMAGE_EXTENSIONS, RAW_EXTENSIONS, VIDEO_EXTENSIONS, AUDIO_EXTENSIONS
+from config import (
+    RAW_EXTENSIONS, VIDEO_EXTENSIONS, AUDIO_EXTENSIONS, PIE_SUPPORTED_EXTENSIONS
+)
 from utils.i18n import _
 from utils.media_utils import (
     parse_datetime_from_filename, get_existing_datetime
@@ -55,43 +57,46 @@ class MediaDateRenamer:
             skip_existing: 如果为 True，跳过已有 EXIF 日期的文件
 
         Returns:
-            tuple: (是否成功, 消息字符串)
+            tuple: (是否成功, 消息字符串, 是否因已有日期被跳过)
         """
         file_path = Path(file_path)
         if not file_path.exists():
-            return False, _("文件不存在: ") + str(file_path)
+            return False, _("文件不存在: ") + str(file_path), False
 
         # 如果启用了跳过已有日期的选项，检查文件是否已有拍摄日期
+        # 只依据 EXIF/QuickTime 日期判断，文件系统时间不算"已有拍摄日期"
         if skip_existing:
-            dt = get_existing_datetime(file_path)
+            dt = get_existing_datetime(file_path, fallback_to_fs=False)
             if dt is not None and dt != datetime.min:
-                return True, _("跳过已有日期数据的文件")
+                return True, _("跳过已有日期数据的文件"), True
 
         # 从文件名解析日期
         parsed_date = self.parse_datetime_from_filename(file_path.name)
         if not parsed_date:
-            return False, _("无法从文件名解析日期时间")
+            return False, _("无法从文件名解析日期时间"), False
 
         # 试运行模式下不实际修改文件
         if self.dry_run:
-            return True, _("试运行: 将设置日期为 ") + parsed_date.strftime('%Y-%m-%d %H:%M:%S')
+            return True, _("试运行: 将设置日期为 ") + parsed_date.strftime('%Y-%m-%d %H:%M:%S'), False
 
         # 根据文件类型选择合适的日期写入方法
         try:
             ext = file_path.suffix.lower()
-            if ext in IMAGE_EXTENSIONS:
-                update_image_date(file_path, parsed_date)
-            elif ext in RAW_EXTENSIONS:
+            if ext in RAW_EXTENSIONS:
                 update_raw_date(file_path, parsed_date)
             elif ext in VIDEO_EXTENSIONS:
                 update_video_date(file_path, parsed_date)
             elif ext in AUDIO_EXTENSIONS:
                 update_audio_date(file_path, parsed_date)
+            elif ext in PIE_SUPPORTED_EXTENSIONS:
+                update_image_date(file_path, parsed_date)
             else:
-                raise Exception(_("不支持的文件格式"))
-            return True, _("成功更新日期: ") + parsed_date.strftime('%Y:%m:%d %H:%M:%S')
+                # 其余 RAW（如 .3fr/.r3d/.bay/.rsd）未收录进 RAW_EXTENSIONS 列，
+                # 但也无法用 piexif，统一走 ExifTool 路径
+                update_raw_date(file_path, parsed_date)
+            return True, _("成功更新日期: ") + parsed_date.strftime('%Y:%m:%d %H:%M:%S'), False
         except Exception as e:
-            return False, _("处理文件时出错: ") + str(e)
+            return False, _("处理文件时出错: ") + str(e), False
 
 
 def update_file_shooting_date(file_path, new_datetime, file_ext):

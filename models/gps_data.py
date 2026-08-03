@@ -16,6 +16,10 @@ class GpsPoint:
 
     def __init__(self, datetime_val, latitude, longitude, altitude=None,
                  source='GPX', source_file=None):
+        if latitude is not None and not -90 <= latitude <= 90:
+            raise ValueError(f"latitude out of range: {latitude}")
+        if longitude is not None and not -180 <= longitude <= 180:
+            raise ValueError(f"longitude out of range: {longitude}")
         # 轨迹点的时间戳（已转换到本地时区）
         self.timestamp = datetime_val
         # 纬度（十进制度数，北正南负）

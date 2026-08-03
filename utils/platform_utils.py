@@ -118,13 +118,16 @@ def show_file_in_explorer(file_path):
     """
     abs_path = os.path.abspath(file_path)
     system = platform.system()
-    if system == "Windows":
-        subprocess.run(['explorer', '/select,', abs_path], check=False, timeout=5)
-    elif system == "Darwin":
-        subprocess.run(['open', '-R', abs_path], check=False, timeout=5)
-    else:
-        try:
-            directory = os.path.dirname(abs_path)
-            subprocess.run(['xdg-open', directory], check=False, timeout=5)
-        except FileNotFoundError:
-            pass
+    try:
+        if system == "Windows":
+            subprocess.run(['explorer', '/select,', abs_path], check=False, timeout=5)
+        elif system == "Darwin":
+            subprocess.run(['open', '-R', abs_path], check=False, timeout=5)
+        else:
+            try:
+                directory = os.path.dirname(abs_path)
+                subprocess.run(['xdg-open', directory], check=False, timeout=5)
+            except FileNotFoundError:
+                pass
+    except Exception:
+        traceback.print_exc()

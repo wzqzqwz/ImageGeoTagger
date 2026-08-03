@@ -18,6 +18,7 @@ from services.export_service import (
     generate_statistics
 )
 from utils.i18n import _
+from utils.media_utils import format_gps_coord
 
 
 class ResultsWindow:
@@ -107,6 +108,16 @@ class ResultsWindow:
 
     def _on_tab_changed(self, event=None):
         self._update_progress_visibility()
+        # 切换到统计页时刷新统计（数据在编辑/删除后可能已变化）
+        sel = self.notebook.select()
+        if sel:
+            try:
+                frame = self.notebook.nametowidget(sel)
+                refresh = getattr(frame, '_refresh_stats', None)
+                if refresh:
+                    refresh()
+            except Exception:
+                traceback.print_exc()
 
     def _update_progress_visibility(self):
         sel = self.notebook.select()
@@ -213,20 +224,33 @@ class ResultsWindow:
                                key=lambda x: x.dt if x.dt else datetime.min)
         filtered_data = original_data.copy()
 
-        def update_display():
-            for item in tree.get_children():
-                tree.delete(item)
-            for i, item in enumerate(filtered_data):
-                time_str = item.dt.strftime('%Y-%m-%d %H:%M:%S') if item.dt and item.dt != datetime.min else _('未知时间')
-                loc_str = _("无位置信息")
-                if item.latitude is not None and item.longitude is not None:
-                    loc_str = f"({item.latitude:.6f}, {item.longitude:.6f})"
-                    if item.altitude is not None:
-                        loc_str += f", {item.altitude:.2f}m"
-                size_str = f"{item.file_size / 1024 / 1024:.2f} MB" if item.file_size else _("未知")
-                tree.insert('', 'end', values=(i + 1, item.filename, time_str, loc_str, size_str))
+        def _format_row(i, item):
+            time_str = item.dt.strftime('%Y-%m-%d %H:%M:%S') if item.dt and item.dt != datetime.min else _('未知时间')
+            loc_str = _("无位置信息")
+            if item.latitude is not None and item.longitude is not None:
+                loc_str = f"({format_gps_coord(item.latitude)}, {format_gps_coord(item.longitude)})"
+                if item.altitude is not None:
+                    loc_str += f", {format_gps_coord(item.altitude)}m"
+            size_str = f"{item.file_size / 1024 / 1024:.2f} MB" if item.file_size else _("未知")
+            return (i + 1, item.filename, time_str, loc_str, size_str)
 
-        def perform_search(*args):
+        def update_display():
+            # 行级增量更新：仅更新值/新增/删除尾部行，避免大列表时整树重建
+            children = tree.get_children()
+            n_old = len(children)
+            n_new = len(filtered_data)
+            common = min(n_old, n_new)
+            for i in range(common):
+                tree.item(children[i], values=_format_row(i, filtered_data[i]))
+            for i in range(common, n_new):
+                tree.insert('', 'end', values=_format_row(i, filtered_data[i]))
+            for i in range(common, n_old):
+                tree.delete(children[i])
+
+        search_job = [None]
+
+        def do_search():
+            search_job[0] = None
             text = search_var.get().lower().strip()
             filtered_data.clear()
             if not text:
@@ -240,11 +264,23 @@ class ResultsWindow:
                         if text in item.dt.strftime('%Y-%m-%d %H:%M:%S').lower():
                             match = True
                     if search_loc.get() and item.latitude is not None:
-                        if text in f"{item.latitude:.6f},{item.longitude:.6f}":
+                        if text in f"{format_gps_coord(item.latitude)},{format_gps_coord(item.longitude)}":
                             match = True
                     if match:
                         filtered_data.append(item)
             apply_current_sort()
+
+        def perform_search(*args):
+            # 防抖：连续输入时延迟 150ms 再执行过滤，避免大列表每次按键全量扫描
+            if search_job[0] is not None:
+                try:
+                    tree.after_cancel(search_job[0])
+                except Exception:
+                    pass
+            try:
+                search_job[0] = tree.after(150, do_search)
+            except Exception:
+                do_search()
 
         search_var.trace_add('write', perform_search)
         search_fn.trace_add('write', perform_search)
@@ -400,27 +436,34 @@ class ResultsWindow:
         if not messagebox.askyesno(_("确认移至回收站"), msg):
             return
 
-        paths = [i.path for i in items if hasattr(i, 'path')]
-        success, failed = send_to_recycle_bin(paths)
-        failed_paths = set(f[0] for f in failed) if failed else set()
+        # 全局互斥：防止与后台 GEO/日期处理正写盘时移动文件导致数据损坏
+        if not self.app.acquire_processing():
+            messagebox.showwarning(_("警告"), _("其他任务正在处理中，请等待完成"), parent=self.window)
+            return
+        try:
+            paths = [i.path for i in items if hasattr(i, 'path')]
+            success, failed = send_to_recycle_bin(paths)
+            failed_paths = set(f[0] for f in failed) if failed else set()
 
-        with self.app.lock:
-            for item in items:
-                # 只有删除成功的文件才从列表中移除，失败的文件保留以便重试
-                if getattr(item, 'path', None) in failed_paths:
-                    continue
-                if item in self.app.a:
-                    self.app.a.remove(item)
-                if item in self.app.b:
-                    self.app.b.remove(item)
+            with self.app.lock:
+                for item in items:
+                    # 只有删除成功的文件才从列表中移除，失败的文件保留以便重试
+                    if getattr(item, 'path', None) in failed_paths:
+                        continue
+                    if item in self.app.a:
+                        self.app.a.remove(item)
+                    if item in self.app.b:
+                        self.app.b.remove(item)
 
-        self.refresh()
-        self.progress_label.config(text="")
-        self.progress_bar['value'] = 25
-        self.window.after(50, lambda: self.progress_bar.config(value=50))
-        self.window.after(100, lambda: self.progress_bar.config(value=75))
-        self.window.after(150, lambda s=success: (self.progress_bar.config(value=100),
-                                                    self.progress_label.config(text=_("已将 ") + str(s) + _(" 个文件移至回收站"))))
+            self.refresh()
+            self.progress_label.config(text="")
+            self.progress_bar['value'] = 25
+            self.window.after(50, lambda: self.progress_bar.config(value=50))
+            self.window.after(100, lambda: self.progress_bar.config(value=75))
+            self.window.after(150, lambda s=success: (self.progress_bar.config(value=100),
+                                                        self.progress_label.config(text=_("已将 ") + str(s) + _(" 个文件移至回收站"))))
+        finally:
+            self.app.release_processing()
 
     def _open_edit_with_map(self, fi, tree, item_id):
         edit = EditCoordinatesDialog(self.app, fi, tree, item_id, self.window, self)
@@ -461,11 +504,14 @@ class ResultsWindow:
                                     for p in gps_data]
                     for i, point in enumerate(gpx_data_list):
                         time_str = point['datetime'].strftime('%Y-%m-%d %H:%M:%S') if point.get('datetime') else _('未知')
-                        lat_str = f"{point['latitude']:.6f}" if point.get('latitude') is not None else _('未知')
-                        lon_str = f"{point['longitude']:.6f}" if point.get('longitude') is not None else _('未知')
-                        alt_str = f"{point['altitude']:.2f}" if point.get('altitude') is not None else _('未知')
+                        lat_str = format_gps_coord(point['latitude']) if point.get('latitude') is not None else _('未知')
+                        lon_str = format_gps_coord(point['longitude']) if point.get('longitude') is not None else _('未知')
+                        alt_str = format_gps_coord(point['altitude']) if point.get('altitude') is not None else _('未知')
                         src = point.get('source_file', _('未知'))
                         gpx_tree.insert('', 'end', values=(i + 1, src, time_str, lat_str, lon_str, alt_str))
+                    state = getattr(gpx_tree, '_gpx_state', None)
+                    if state is not None:
+                        state['data'] = gpx_data_list
                 except Exception:
                     traceback.print_exc()
 
@@ -487,15 +533,8 @@ class ResultsWindow:
                     traceback.print_exc()
         except Exception:
             traceback.print_exc()
-            # 刷新失败时仅关闭窗口，避免递归调用 show_results 导致无限循环
-            try:
-                self.window.destroy()
-            except Exception:
-                traceback.print_exc()
-            try:
-                self.geo_tab.result_window = None
-            except Exception:
-                pass
+            # 刷新失败时保留窗口，避免丢失用户当前视图；
+            # 不销毁窗口也不清空 result_window，后续刷新或用户操作仍可继续
 
     def _setup_gpx_tab(self, notebook):
         frame = ttk.Frame(notebook)
@@ -512,7 +551,9 @@ class ResultsWindow:
         self._gpx_count_label = ttk.Label(toolbar, text=_("共 ") + str(len(self.app.gps_data)) + _(" 个轨迹点"))
         self._gpx_count_label.pack(side=tk.LEFT)
 
-        gpx_data_list = self._get_gpx_data_list()
+        # 用可变容器保存当前轨迹点快照，refresh() 重建列表后更新它，
+        # 使右键菜单/双击等闭包始终引用最新数据
+        gpx_state = {'data': self._get_gpx_data_list()}
 
         columns = ('seq', 'gpx_file', 'time', 'lat', 'lon', 'alt')
         tree = ttk.Treeview(frame, columns=columns, show='headings', height=14,
@@ -535,16 +576,17 @@ class ResultsWindow:
         tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(5, 0), pady=(0, 3))
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y, pady=(0, 3))
 
-        for i, point in enumerate(gpx_data_list):
+        for i, point in enumerate(gpx_state['data']):
             time_str = point['datetime'].strftime('%Y-%m-%d %H:%M:%S') if point.get('datetime') else _('未知')
-            lat_str = f"{point['latitude']:.6f}" if point.get('latitude') is not None else _('未知')
-            lon_str = f"{point['longitude']:.6f}" if point.get('longitude') is not None else _('未知')
-            alt_str = f"{point['altitude']:.2f}" if point.get('altitude') is not None else _('未知')
+            lat_str = format_gps_coord(point['latitude']) if point.get('latitude') is not None else _('未知')
+            lon_str = format_gps_coord(point['longitude']) if point.get('longitude') is not None else _('未知')
+            alt_str = format_gps_coord(point['altitude']) if point.get('altitude') is not None else _('未知')
             src = point.get('source_file', _('未知'))
             tree.insert('', 'end', values=(i + 1, src, time_str, lat_str, lon_str, alt_str))
 
         self._tab_trees['gpx'] = tree
         self._tab_frames['gpx'] = frame
+        tree._gpx_state = gpx_state
 
         def show_gpx_context_menu(event):
             item_id = tree.identify_row(event.y)
@@ -555,6 +597,7 @@ class ResultsWindow:
                 tree.selection_set(item_id)
                 sel = [item_id]
 
+            gpx_data_list = gpx_state['data']
             menu = tk.Menu(tree, tearoff=0)
 
             if len(sel) == 1:
@@ -608,6 +651,7 @@ class ResultsWindow:
             if not item_id:
                 return
             idx = tree.index(item_id)
+            gpx_data_list = gpx_state['data']
             if 0 <= idx < len(gpx_data_list):
                 GpxPointDetails(self.app, gpx_data_list[idx], self.geo_tab)
 
@@ -659,8 +703,8 @@ class ResultsWindow:
         if times:
             lines.append(_("时间范围: ") + min(times).strftime('%Y-%m-%d %H:%M:%S') + _(" 到 ") + max(times).strftime('%Y-%m-%d %H:%M:%S'))
         if lats and lons:
-            lines.append(_("纬度范围: ") + f"{min(lats):.6f}" + _(" 到 ") + f"{max(lats):.6f}")
-            lines.append(_("经度范围: ") + f"{min(lons):.6f}" + _(" 到 ") + f"{max(lons):.6f}")
+            lines.append(_("纬度范围: ") + f"{min(lats):.8f}" + _(" 到 ") + f"{max(lats):.8f}")
+            lines.append(_("经度范围: ") + f"{min(lons):.8f}" + _(" 到 ") + f"{max(lons):.8f}")
         if alts:
             lines.append(_("高度范围: ") + f"{min(alts):.2f}" + _(" 到 ") + f"{max(alts):.2f}" + _(" 米"))
         messagebox.showinfo(_("轨迹点统计"), "\n".join(lines))
@@ -669,29 +713,38 @@ class ResultsWindow:
         count = len(selected_items)
         if not messagebox.askyesno(_("确认删除"), _("确定要从列表中删除这 ") + str(count) + _(" 个轨迹点吗？\n（不会删除原始 GPX 文件）")):
             return
-        selected_keys = set()
+        # 按行值（时间, 纬度, 经度, 来源文件）匹配，不用快照下标删 live 列表，
+        # 避免扫描期间列表被重建后下标错位误删其它点
+        selected_keys = []
         for s in selected_items:
             if not tree.exists(s):
                 continue
             vals = tree.item(s, 'values')
             if vals and len(vals) >= 6:
-                selected_keys.add((vals[2], vals[3], vals[4]))
+                selected_keys.append((vals[2], vals[3], vals[4], vals[1]))
 
-        def _matches(d):
+        def _key(d):
             t = d.get('datetime', '')
             if hasattr(t, 'strftime'):
                 t = t.strftime('%Y-%m-%d %H:%M:%S')
-            lat = f"{d.get('latitude', ''):.6f}" if d.get('latitude') is not None else ''
-            lon = f"{d.get('longitude', ''):.6f}" if d.get('longitude') is not None else ''
-            return (t, lat, lon) in selected_keys
+            lat = format_gps_coord(d.get('latitude')) if d.get('latitude') is not None else ''
+            lon = format_gps_coord(d.get('longitude')) if d.get('longitude') is not None else ''
+            src = d.get('source_file', '') or ''
+            return (t, lat, lon, src)
 
-        indices_to_del = [i for i, d in enumerate(gpx_data_list) if _matches(d)]
-        for idx in reversed(indices_to_del):
-            del gpx_data_list[idx]
+        def _remove_first_matching(lst, key):
+            for i, d in enumerate(lst):
+                if _key(d) == key:
+                    del lst[i]
+                    return True
+            return False
+
+        # 快照列表与 live 列表各自按键删除；重复点只删除选中的个数（每键删一个）
+        for key in selected_keys:
+            _remove_first_matching(gpx_data_list, key)
         with self.app.lock:
-            for idx in reversed(indices_to_del):
-                if 0 <= idx < len(self.app.gps_data):
-                    del self.app.gps_data[idx]
+            for key in selected_keys:
+                _remove_first_matching(self.app.gps_data, key)
         for item in selected_items:
             try:
                 tree.delete(item)
@@ -719,8 +772,14 @@ class ResultsWindow:
         self._tab_trees['stats'] = text
 
         def refresh_stats():
-            gpx_data_list = self._get_gpx_data_list()
-            stats = generate_statistics(self.app.a, self.app.b, gpx_data_list,
+            # 与 refresh() 一致，在锁内快照列表，避免处理期间列表被修改
+            with self.app.lock:
+                a_list = list(self.app.a)
+                b_list = list(self.app.b)
+                gps_snapshot = list(self.app.gps_data)
+            gpx_data_list = [p.to_dict() if hasattr(p, 'to_dict') else p
+                             for p in gps_snapshot]
+            stats = generate_statistics(a_list, b_list, gpx_data_list,
                                         initial_a_count=self.app.initial_a_count,
                                         initial_b_count=self.app.initial_b_count,
                                         updated_count=self.app.updated_count)
@@ -729,10 +788,6 @@ class ResultsWindow:
             text.insert(tk.END, stats)
             text.config(state=tk.DISABLED)
 
-        def on_tab_change(event):
-            stats_idx = self._tab_indices.get('stats', 3)
-            if notebook.index(notebook.select()) == stats_idx:
-                refresh_stats()
-
-        notebook.bind('<<NotebookTabChanged>>', on_tab_change)
+        # 供 _on_tab_changed 在切换到统计页时刷新（该绑定不被 80 行覆盖）
+        frame._refresh_stats = refresh_stats
         refresh_stats()
