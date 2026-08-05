@@ -8,7 +8,6 @@ import tkinter as tk
 from ui import custom_msgbox as messagebox
 import os
 import platform
-import traceback
 
 # 拖拽支持库，允许用户拖拽文件夹到窗口中
 try:
@@ -20,12 +19,15 @@ except ImportError:
 from ui.main_window import MainWindow
 from utils.platform_utils import hide_console_window, get_app_dir
 from utils.i18n import _, load_lang
+from utils.logging_utils import setup_logging, log_exc
 
 
 def main():
     """应用程序主入口函数"""
     # 隐藏 Windows 控制台窗口（对于打包后的 exe 程序）
     hide_console_window()
+    # 初始化文件日志（打包版隐藏控制台后异常仍可写入 ~/.imagegeotagger/ 排查）
+    setup_logging()
 
     root = None
     try:
@@ -51,7 +53,7 @@ def main():
                 root._icon_photo = tk.PhotoImage(file=icon_png)
                 root.iconphoto(True, root._icon_photo)
         except Exception:
-            traceback.print_exc()
+            log_exc()
 
         MainWindow(root)
 
@@ -63,7 +65,7 @@ def main():
             load_lang()
             messagebox.showerror(_("启动错误"), _("应用程序启动失败:\n") + str(e), parent=root)
         except Exception:
-            traceback.print_exc()
+            log_exc()
 
 
 if __name__ == "__main__":

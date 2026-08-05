@@ -7,9 +7,9 @@
 """
 
 import os
-import traceback
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
+from utils.logging_utils import log_exc
 
 try:
     from defusedxml import ElementTree as SafeET
@@ -130,13 +130,13 @@ def parse_gpx_time(time_str):
                 dt = datetime.fromisoformat(time_str.replace('Z', '+00:00'))
                 return dt.astimezone().replace(tzinfo=None)
             except Exception:
-                traceback.print_exc()
+                log_exc()
         if '.' in time_str:
             return datetime.strptime(time_str, "%Y-%m-%dT%H:%M:%S.%f")
         else:
             return datetime.strptime(time_str, "%Y-%m-%dT%H:%M:%S")
     except Exception:
-        traceback.print_exc()
+        log_exc()
         for fmt in ["%Y-%m-%d %H:%M:%S", "%Y/%m/%d %H:%M:%S",
                     "%Y-%m-%d %H:%M:%S.%f", "%Y/%m/%d %H:%M:%S.%f"]:
             try:
@@ -228,7 +228,7 @@ def parse_gpx_file(gpx_file_path):
                 'source_file': os.path.basename(gpx_file_path),
             })
     except Exception:
-        traceback.print_exc()
+        log_exc()
 
     return points
 

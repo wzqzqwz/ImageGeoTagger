@@ -6,10 +6,10 @@
 
 import os
 import sys
-import traceback
 import platform
 import subprocess
 from utils.i18n import _
+from utils.logging_utils import log_exc
 
 
 def _thread_is_alive(t):
@@ -58,7 +58,7 @@ def hide_console_window():
         if console_window:
             user32.ShowWindow(console_window, 0)  # SW_HIDE = 0
     except Exception:
-        traceback.print_exc()
+        log_exc()
 
 
 def get_startupinfo():
@@ -138,4 +138,4 @@ def show_file_in_explorer(file_path):
             except FileNotFoundError:
                 pass
     except Exception:
-        traceback.print_exc()
+        log_exc()

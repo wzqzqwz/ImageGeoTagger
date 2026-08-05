@@ -15,12 +15,12 @@ from services.export_service import (
     generate_statistics,
 )
 from utils.i18n import _
+from utils.logging_utils import log_exc
 from utils.platform_utils import _thread_is_alive
 try:
     from tkinterdnd2 import DND_FILES
 except ImportError:
     DND_FILES = None
-import traceback
 
 
 class GeoTab:
@@ -326,7 +326,7 @@ class GeoTab:
         try:
             self.app.post_to_ui(callback)
         except Exception:
-            traceback.print_exc()
+            log_exc()
 
     def show_messagebox(self, msg_type, title, message, parent=None):
         if parent is None:
@@ -558,7 +558,7 @@ class GeoTab:
                     self.result_window.window.lift()
                     return
             except Exception:
-                traceback.print_exc()
+                log_exc()
 
         from ui.results_window import ResultsWindow
         self.result_window = ResultsWindow(self)

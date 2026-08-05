@@ -5,7 +5,6 @@ from tkinter import ttk
 from ui import custom_msgbox as messagebox
 import platform
 import threading
-import traceback
 from datetime import datetime
 
 from ui.dialogs import (
@@ -17,7 +16,9 @@ from utils.platform_utils import open_file_with_system, show_file_in_explorer
 from services.export_service import (
     generate_statistics
 )
+from ui.tk_safe import pulse_progress
 from utils.i18n import _
+from utils.logging_utils import log_exc
 from utils.media_utils import format_gps_coord
 
 
@@ -85,7 +86,7 @@ class ResultsWindow:
             try:
                 self.window.destroy()
             except Exception:
-                traceback.print_exc()
+                log_exc()
         self.window.protocol("WM_DELETE_WINDOW", on_close)
 
         self.window.update_idletasks()
@@ -117,7 +118,7 @@ class ResultsWindow:
                 if refresh:
                     refresh()
             except Exception:
-                traceback.print_exc()
+                log_exc()
 
     def _update_progress_visibility(self):
         sel = self.notebook.select()
@@ -428,10 +429,8 @@ class ResultsWindow:
         self.refresh()
         self.progress_label.config(text="")
         self.progress_bar['value'] = 25
-        self.window.after(50, lambda: self.progress_bar.config(value=50))
-        self.window.after(100, lambda: self.progress_bar.config(value=75))
-        self.window.after(150, lambda: (self.progress_bar.config(value=100),
-                                         self.progress_label.config(text=_("已从序列中删除 ") + str(len(items)) + _(" 个文件"))))
+        pulse_progress(self.window, self.progress_bar, self.progress_label,
+                       _("已从序列中删除 ") + str(len(items)) + _(" 个文件"))
 
     def _delete_items(self, tree, selected_items, filtered_data):
         items = self._resolve_items(tree, selected_items, filtered_data)
@@ -479,10 +478,8 @@ class ResultsWindow:
             self.refresh()
             self.progress_label.config(text="")
             self.progress_bar['value'] = 25
-            self.window.after(50, lambda: self.progress_bar.config(value=50))
-            self.window.after(100, lambda: self.progress_bar.config(value=75))
-            self.window.after(150, lambda s=success: (self.progress_bar.config(value=100),
-                                                        self.progress_label.config(text=_("已将 ") + str(s) + _(" 个文件移至回收站"))))
+            pulse_progress(self.window, self.progress_bar, self.progress_label,
+                           _("已将 ") + str(success) + _(" 个文件移至回收站"))
         finally:
             self.app.release_processing()
 
@@ -514,7 +511,7 @@ class ResultsWindow:
                         snapshot = a_list if tab_type == 'with_location' else b_list
                         tree.sync_search(data_snapshot=snapshot)
                     except Exception:
-                        traceback.print_exc()
+                        log_exc()
 
             gpx_tree = self._tab_trees.get('gpx')
             if gpx_tree:
@@ -534,7 +531,7 @@ class ResultsWindow:
                     if state is not None:
                         state['data'] = gpx_data_list
                 except Exception:
-                    traceback.print_exc()
+                    log_exc()
 
             stats_text = self._tab_trees.get('stats')
             if stats_text:
@@ -551,9 +548,9 @@ class ResultsWindow:
                     stats_text.insert(tk.END, stats)
                     stats_text.config(state=tk.DISABLED)
                 except Exception:
-                    traceback.print_exc()
+                    log_exc()
         except Exception:
-            traceback.print_exc()
+            log_exc()
             # 刷新失败时保留窗口，避免丢失用户当前视图；
             # 不销毁窗口也不清空 result_window，后续刷新或用户操作仍可继续
 
@@ -710,7 +707,7 @@ class ResultsWindow:
                 f.write(prettify_xml(root))
             messagebox.showinfo(_("导出成功"), _("已导出到:\n") + fp)
         except Exception:
-            traceback.print_exc()
+            log_exc()
             messagebox.showerror(_("导出失败"), _("导出过程中发生错误，请检查文件路径和权限。"))
 
     def _show_gpx_stats(self, points):
@@ -777,7 +774,7 @@ class ResultsWindow:
             try:
                 tree.delete(item)
             except Exception:
-                traceback.print_exc()
+                log_exc()
         for i, item in enumerate(tree.get_children()):
             vals = list(tree.item(item, 'values'))
             if vals:

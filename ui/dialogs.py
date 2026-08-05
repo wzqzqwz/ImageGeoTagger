@@ -2,14 +2,15 @@
 
 import os
 import threading
-import traceback
 import webbrowser
 from datetime import datetime
 
 import tkinter as tk
 from tkinter import ttk
 from ui import custom_msgbox as messagebox
+from ui.tk_safe import pulse_progress
 from utils.i18n import _
+from utils.logging_utils import log_exc
 from utils.media_utils import format_gps_coord
 
 MAP_SELECTOR_URL = "https://maps.apple.com"
@@ -81,12 +82,12 @@ def _paste_date_to_entries(window, date_entry, time_entry):
             messagebox.showwarning(_("粘贴失败"), _("剪贴板内容不包含有效日期格式"),
                                    parent=window)
         except Exception:
-            traceback.print_exc()
+            log_exc()
     except Exception:
         try:
             messagebox.showwarning(_("粘贴失败"), _("无法读取剪贴板"), parent=window)
         except Exception:
-            traceback.print_exc()
+            log_exc()
     return False
 
 
@@ -282,7 +283,7 @@ class EditCoordinatesDialog:
                     self.app.root.clipboard_clear()
                     self.app.root.clipboard_append(text)
                 except Exception:
-                    traceback.print_exc()
+                    log_exc()
 
             self.app.location_clipboard.update({
                 'latitude': lat, 'longitude': lon, 'altitude': alt,
@@ -306,7 +307,7 @@ class EditCoordinatesDialog:
             if result:
                 lat_str, lon_str, alt_str = result
         except Exception:
-            traceback.print_exc()
+            log_exc()
 
         if lat_str is not None and lon_str is not None:
             self.lat_var.set(lat_str)
@@ -356,7 +357,7 @@ class EditCoordinatesDialog:
                         _("剪贴板: ") + f"({lat_str}, {lon_str})" + _(" | 来源: 系统剪贴板"))
                 return
         except Exception:
-            traceback.print_exc()
+            log_exc()
 
         ic = self.app.location_clipboard
         if ic['latitude'] is not None:
@@ -380,7 +381,7 @@ class EditCoordinatesDialog:
             try:
                 write_job()
             except Exception as e:
-                traceback.print_exc()
+                log_exc()
                 self.app.post_to_ui(lambda err=str(e): self._show_apply_error(err))
                 return
             self.app.post_to_ui(on_success)
@@ -405,7 +406,7 @@ class EditCoordinatesDialog:
         try:
             messagebox.showerror(_("错误"), _("操作失败") + ": " + err, parent=self.window)
         except Exception:
-            traceback.print_exc()
+            log_exc()
         self._release_if_acquired()
 
     def _save(self):
@@ -494,7 +495,7 @@ class EditCoordinatesDialog:
                         return
                     self._finalize_save()
                 except Exception:
-                    traceback.print_exc()
+                    log_exc()
                     self._release_if_acquired()
 
             def _write_job():
@@ -518,14 +519,14 @@ class EditCoordinatesDialog:
             try:
                 messagebox.showerror(_("错误"), _("请输入有效的数值"), parent=self.window)
             except Exception:
-                traceback.print_exc()
+                log_exc()
             self._release_if_acquired()
         except Exception:
-            traceback.print_exc()
+            log_exc()
             try:
                 messagebox.showerror(_("错误"), _("操作失败"), parent=self.window)
             except Exception:
-                traceback.print_exc()
+                log_exc()
             self._release_if_acquired()
 
     def _release_if_acquired(self):
@@ -582,7 +583,7 @@ class EditCoordinatesDialog:
                             self.app.post_to_ui(
                                 lambda d=done, t=total: self._update_batch_progress(rw, d, t))
             except Exception:
-                traceback.print_exc()
+                log_exc()
             self.app.post_to_ui(
                 lambda: self._finish_same_location_batch(batch_failures, total, moves))
 
@@ -597,7 +598,7 @@ class EditCoordinatesDialog:
                 rw.progress_label.config(
                     text=_("批量更新中... ") + str(done) + "/" + str(total))
         except Exception:
-            traceback.print_exc()
+            log_exc()
 
     def _finish_same_location_batch(self, batch_failures, total, moves=None):
         rw = self.results_window
@@ -612,7 +613,7 @@ class EditCoordinatesDialog:
                         _("有 ") + str(batch_failures) + _(" 个相同位置的文件更新失败"),
                         parent=self.window)
         except Exception:
-            traceback.print_exc()
+            log_exc()
         if moves:
             # 主线程加锁统一写入属性，避免 worker 线程直接改对象造成撕裂读
             with self.app.lock:
@@ -623,7 +624,7 @@ class EditCoordinatesDialog:
                         fi.longitude = lon
                         fi.altitude = alt
                     except Exception:
-                        traceback.print_exc()
+                        log_exc()
         self._finalize_save()
 
     def _finalize_save(self):
@@ -643,7 +644,7 @@ class EditCoordinatesDialog:
             try:
                 self.tree.delete(self.item_id)
             except Exception:
-                traceback.print_exc()
+                log_exc()
 
             if self.results_window:
                 self.results_window.refresh()
@@ -653,22 +654,20 @@ class EditCoordinatesDialog:
                 if rw:
                     rw.progress_label.config(text="")
                     rw.progress_bar['value'] = 25
-                    rw.window.after(50, lambda: rw.progress_bar.config(value=50))
-                    rw.window.after(100, lambda: rw.progress_bar.config(value=75))
-                    rw.window.after(150, lambda: (rw.progress_bar.config(value=100),
-                                                   rw.progress_label.config(text=_("位置信息已更新"))))
+                    pulse_progress(rw.window, rw.progress_bar, rw.progress_label,
+                                   _("位置信息已更新"))
             except Exception:
-                traceback.print_exc()
+                log_exc()
             self._on_close()
 
         except Exception:
-            traceback.print_exc()
+            log_exc()
             # 窗口可能已被用户关闭：此时写盘已成功，不再误报"操作失败"
             if self._dialog_alive():
                 try:
                     messagebox.showerror(_("错误"), _("操作失败"), parent=self.window)
                 except Exception:
-                    traceback.print_exc()
+                    log_exc()
         finally:
             self._release_if_acquired()
 
@@ -696,26 +695,26 @@ class EditCoordinatesDialog:
                     try:
                         self.tree.delete(self.item_id)
                     except Exception:
-                        traceback.print_exc()
+                        log_exc()
 
                     if self.results_window:
                         try:
                             self.results_window.refresh()
                         except Exception:
-                            traceback.print_exc()
+                            log_exc()
 
                     try:
                         messagebox.showinfo(_("成功"), _("GPS信息已清空"), parent=self.window)
                     except Exception:
-                        traceback.print_exc()
+                        log_exc()
                     self._on_close()
                 except Exception:
-                    traceback.print_exc()
+                    log_exc()
                     if self._dialog_alive():
                         try:
                             messagebox.showerror(_("错误"), _("操作失败"), parent=self.window)
                         except Exception:
-                            traceback.print_exc()
+                            log_exc()
                 finally:
                     self._release_if_acquired()
 
@@ -730,7 +729,7 @@ class EditCoordinatesDialog:
             url = MAP_SELECTOR_URL if primary_reachable else MAP_SELECTOR_URL_BACKUP
             webbrowser.open(url)
         except Exception:
-            traceback.print_exc()
+            log_exc()
 
 
 class EditShootingDateDialog:
@@ -849,9 +848,9 @@ class EditShootingDateDialog:
                     messagebox.showinfo(_("已复制"), _("日期已复制到剪贴板:\n") + text,
                                        parent=self.window)
                 except Exception:
-                    traceback.print_exc()
+                    log_exc()
         except Exception:
-            traceback.print_exc()
+            log_exc()
 
     def _paste_date(self):
         _paste_date_to_entries(self.window, self.date_entry, self.time_entry)
@@ -866,7 +865,7 @@ class EditShootingDateDialog:
             try:
                 write_job()
             except Exception as e:
-                traceback.print_exc()
+                log_exc()
                 self.app.post_to_ui(lambda err=str(e): self._show_apply_error(err))
                 return
             self.app.post_to_ui(on_success)
@@ -891,7 +890,7 @@ class EditShootingDateDialog:
         try:
             messagebox.showerror(_("错误"), _("操作失败") + ": " + err, parent=self.window)
         except Exception:
-            traceback.print_exc()
+            log_exc()
         self._release_if_acquired()
 
     def _release_if_acquired(self):
@@ -923,7 +922,7 @@ class EditShootingDateDialog:
             else:
                 new_dt = None
         except Exception:
-            traceback.print_exc()
+            log_exc()
             self._release_if_acquired()
             return
 
@@ -974,18 +973,18 @@ class EditShootingDateDialog:
                                     self.file_info['_new_filename_display'] = new_fn
                                 self.tree.item(self.item_id, values=values)
                         except Exception:
-                            traceback.print_exc()
+                            log_exc()
                     if hasattr(self.tree, 'sync_search'):
                         try:
                             self.tree.sync_search()
                         except Exception:
-                            traceback.print_exc()
+                            log_exc()
 
                 if self.results_window and hasattr(self.results_window, 'refresh'):
                     try:
                         self.results_window.refresh()
                     except Exception:
-                        traceback.print_exc()
+                        log_exc()
 
                 try:
                     log_date = new_dt.strftime('%Y-%m-%d %H:%M:%S') if new_dt else _('无（已清除）')
@@ -994,9 +993,9 @@ class EditShootingDateDialog:
                         try:
                             self.results_window._append_log(log_msg)
                         except Exception:
-                            traceback.print_exc()
+                            log_exc()
                 except Exception:
-                    traceback.print_exc()
+                    log_exc()
                 try:
                     if self.results_window and hasattr(self.results_window, '_pulse_progress'):
                         self.results_window._pulse_progress()
@@ -1004,23 +1003,21 @@ class EditShootingDateDialog:
                         rw = self.results_window
                         rw.progress_label.config(text="")
                         rw.progress_bar['value'] = 25
-                        rw.window.after(50, lambda: rw.progress_bar.config(value=50))
-                        rw.window.after(100, lambda: rw.progress_bar.config(value=75))
-                        rw.window.after(150, lambda: (rw.progress_bar.config(value=100),
-                                                       rw.progress_label.config(text=_("拍摄日期已更新"))))
+                        pulse_progress(rw.window, rw.progress_bar, rw.progress_label,
+                                       _("拍摄日期已更新"))
                 except Exception:
-                    traceback.print_exc()
+                    log_exc()
                 try:
                     self.window.destroy()
                 except Exception:
-                    traceback.print_exc()
+                    log_exc()
             except Exception:
-                traceback.print_exc()
+                log_exc()
                 if self._dialog_alive():
                     try:
                         messagebox.showerror(_("错误"), _("操作失败"), parent=self.window)
                     except Exception:
-                        traceback.print_exc()
+                        log_exc()
             finally:
                 self._release_if_acquired()
 
@@ -1115,9 +1112,9 @@ class BatchDateEditDialog:
                     messagebox.showinfo(_("已复制"), _("日期已复制到剪贴板:\n") + text,
                                        parent=self.window)
                 except Exception:
-                    traceback.print_exc()
+                    log_exc()
         except Exception:
-            traceback.print_exc()
+            log_exc()
 
     def _paste_date(self):
         _paste_date_to_entries(self.window, self.date_entry, self.time_entry)
@@ -1143,7 +1140,7 @@ class BatchDateEditDialog:
                 try:
                     self.refresh_callback(new_dt, self.selected_files)
                 except Exception:
-                    traceback.print_exc()
+                    log_exc()
                 finally:
                     self._release_if_acquired()
                 return
@@ -1185,7 +1182,7 @@ class BatchDateEditDialog:
                                     prog_failed[0] += 1
                                 prog_done[0] += 1
                 except Exception:
-                    traceback.print_exc()
+                    log_exc()
                 finally:
                     # 主窗口已销毁导致 poll 停止轮询时，在此兜底释放互斥锁，
                     # 避免全局锁被永久占用（_app_closing 为纯 Python 标志，
@@ -1229,12 +1226,12 @@ class BatchDateEditDialog:
                         return
                     self.app.root.after(200, poll)
                 except Exception:
-                    traceback.print_exc()
+                    log_exc()
                     if self._root_alive():
                         try:
                             self.app.root.after(200, poll)
                         except Exception:
-                            traceback.print_exc()
+                            log_exc()
                     # 主窗口已销毁：停止轮询（process 线程 finally 会释放锁）
 
             prog_thread.start()
@@ -1243,13 +1240,13 @@ class BatchDateEditDialog:
             try:
                 messagebox.showerror(_("格式错误"), _("日期时间格式不正确"), parent=self.window)
             except Exception:
-                traceback.print_exc()
+                log_exc()
         except Exception:
-            traceback.print_exc()
+            log_exc()
             try:
                 messagebox.showerror(_("错误"), _("操作失败"), parent=self.window)
             except Exception:
-                traceback.print_exc()
+                log_exc()
 
     def _update_results_progress(self, value, text=""):
         try:
@@ -1259,7 +1256,7 @@ class BatchDateEditDialog:
                 rw.progress_label.config(text=text)
                 rw.window.update()
         except Exception:
-            traceback.print_exc()
+            log_exc()
 
     def _release_if_acquired(self):
         if getattr(self, '_processing_acquired', False):
@@ -1274,12 +1271,12 @@ class BatchDateEditDialog:
                 rw.progress_label.config(text=_("完成: ") + str(success) + _("成功/") + str(failed) + _("失败"))
                 rw.window.update()
         except Exception:
-            traceback.print_exc()
+            log_exc()
         if self.tree:
             try:
                 self.tree.sync_search()
             except Exception:
-                traceback.print_exc()
+                log_exc()
         self._release_if_acquired()
 
     def _root_alive(self):
@@ -1316,12 +1313,12 @@ class BatchDateEditDialog:
                         fi.dt = new_dt
                         fi.manual_edit_date = True
                 except Exception:
-                    traceback.print_exc()
+                    log_exc()
         if self.tree:
             try:
                 self.tree.sync_search()
             except Exception:
-                traceback.print_exc()
+                log_exc()
 class BatchLocationEditDialog:
     """批量编辑位置信息对话框"""
 
@@ -1402,7 +1399,7 @@ class BatchLocationEditDialog:
                 rw.progress_label.config(text=text)
                 rw.window.update_idletasks()
         except Exception:
-            traceback.print_exc()
+            log_exc()
 
     def _release_if_acquired(self):
         if getattr(self, '_processing_acquired', False):
@@ -1430,7 +1427,7 @@ class BatchLocationEditDialog:
             url = MAP_SELECTOR_URL if primary_reachable else MAP_SELECTOR_URL_BACKUP
             webbrowser.open(url)
         except Exception:
-            traceback.print_exc()
+            log_exc()
 
     def _paste_location(self):
         try:
@@ -1454,10 +1451,10 @@ class BatchLocationEditDialog:
                             _("系统剪贴板内容不包含有效坐标\n请复制形如 \"39.90882, 116.39747\" 的坐标信息"),
                             parent=self.window)
                     except Exception:
-                        traceback.print_exc()
+                        log_exc()
                     return
         except Exception:
-            traceback.print_exc()
+            log_exc()
 
         clip = self.app.location_clipboard
         if clip['latitude'] is not None and clip['longitude'] is not None:
@@ -1473,7 +1470,7 @@ class BatchLocationEditDialog:
         try:
             messagebox.showwarning(_("粘贴失败"), _("系统剪贴板和位置信息剪贴板均为空"), parent=self.window)
         except Exception:
-            traceback.print_exc()
+            log_exc()
 
     def _apply(self):
         try:
@@ -1563,7 +1560,7 @@ class BatchLocationEditDialog:
                 self.app.post_to_ui(lambda s=success, f=failed, mv=moves:
                                     self._on_loc_batch_done(s, f, mv))
             except Exception:
-                traceback.print_exc()
+                log_exc()
                 # 异常时不再走 _on_loc_batch_done（moves 可能不完整），只释放锁
                 self.app.post_to_ui(self._release_if_acquired)
             finally:
@@ -1599,20 +1596,20 @@ class BatchLocationEditDialog:
                                 self.app.a.remove(fi)
                                 self.app.b.append(fi)
                     except Exception:
-                        traceback.print_exc()
+                        log_exc()
         # 先释放全局互斥锁：show_results 内部会重建结果窗口并可能触发
         # 新的后台任务（需要 acquire_processing），持锁调用会互相等待卡死
         self._release_if_acquired()
         try:
             self.app.geo_tab.show_results()
         except Exception:
-            traceback.print_exc()
+            log_exc()
         try:
             rw = self.app.geo_tab.result_window
             if rw:
                 rw.progress_label.config(text=_("完成: ") + str(success) + _("成功/") + str(failed) + _("失败"))
         except Exception:
-            traceback.print_exc()
+            log_exc()
 
 
 class GpxPointDetails:
@@ -1675,12 +1672,12 @@ class GpxPointDetails:
                         self.app.root.clipboard_clear()
                         self.app.root.clipboard_append(coord_text)
                     except Exception:
-                        traceback.print_exc()
+                        log_exc()
                 try:
                     messagebox.showinfo(_("已复制"), _("坐标已复制到剪贴板:\n") + coord_text,
                                        parent=self.window)
                 except Exception:
-                    traceback.print_exc()
+                    log_exc()
 
         geo_tab_ref = geo_tab or getattr(self.app, 'geo_tab', None)
 

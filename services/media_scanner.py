@@ -7,7 +7,6 @@
 
 import os
 import threading
-import traceback
 from datetime import datetime
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -22,6 +21,7 @@ from utils.gpx_utils import parse_gpx_file
 from utils.media_utils import get_file_creation_datetime
 from models.media_file import MediaFileInfo
 from models.gps_data import GpsPoint
+from utils.logging_utils import log_exc
 
 
 def scan_folder(folder_path, progress_callback=None, only_process_with_date=False,
@@ -54,7 +54,7 @@ def scan_folder(folder_path, progress_callback=None, only_process_with_date=Fals
     # onerror 只跳过无法访问的目录（打印日志继续遍历），
     # 避免一个无权限子目录中断整个扫描导致文件/轨迹漏扫
     def _on_walk_error(exc):
-        traceback.print_exc()
+        log_exc()
 
     try:
         if not os.path.isdir(folder_path):
@@ -98,7 +98,7 @@ def scan_folder(folder_path, progress_callback=None, only_process_with_date=Fals
             try:
                 info = fut.result()
             except Exception:
-                traceback.print_exc()
+                log_exc()
                 done += 1
                 continue
             # 如果设置了只处理有日期的文件，跳过无日期的

@@ -6,12 +6,12 @@ import queue
 import tkinter as tk
 from tkinter import ttk
 import threading
-import traceback
 
 from ui import custom_msgbox as messagebox
 from ui.geo_tab import GeoTab
 from ui.date_tab import DateTab
 from utils.i18n import _, get_language, load_lang, get_supported_languages, set_language
+from utils.logging_utils import log_exc
 from utils.platform_utils import _thread_is_alive
 
 # 窗口配置写入用户主目录，避免打包版写入 _MEIPASS 临时目录导致永久失效
@@ -107,7 +107,7 @@ class MainWindow:
                 try:
                     fn()
                 except Exception:
-                    traceback.print_exc()
+                    log_exc()
         except queue.Empty:
             pass
         try:
@@ -218,7 +218,7 @@ class MainWindow:
             self._closing = True
             self.root.destroy()
         except Exception:
-            traceback.print_exc()
+            log_exc()
             try:
                 self._closing = True
                 self.root.destroy()
@@ -305,4 +305,4 @@ class MainWindow:
             new_width = max(self._calc_tab_width(idx), 520 if idx == 0 else 750)
             self.root.geometry(f"{new_width}x{cur_h}+{self.root.winfo_x()}+{self.root.winfo_y()}")
         except Exception:
-            traceback.print_exc()
+            log_exc()

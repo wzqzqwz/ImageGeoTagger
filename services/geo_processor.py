@@ -22,6 +22,7 @@ from utils.exif_utils import (
     update_image_gps, update_raw_gps, update_video_gps, update_audio_gps
 )
 from utils.i18n import _
+from utils.logging_utils import log_exc
 
 
 def _get_dt(obj):
@@ -121,19 +122,19 @@ def process_location_info(a_list, b_list, gps_data, threshold_minutes=30,
                     result = fut.result()
                 except Exception:
                     # 匹配阶段真实异常：不应静默吞掉；若未提供日志回调则至少在控制台可查
-                    traceback.print_exc()
+                    log_exc()
                     if log_callback:
                         try:
                             log_callback(_("匹配异常: ") + repr(futs[fut]) + " - " + (traceback.format_exc(limit=1)))
                         except Exception:
-                            traceback.print_exc()
+                            log_exc()
                     result = None
                 processed += 1
                 try:
                     if progress_callback:
                         progress_callback(processed / total * 100, processed, total, _("比对进度"))
                 except Exception:
-                    traceback.print_exc()
+                    log_exc()
 
                 if result:
                     # result = (img, loc)；写盘成功前不修改 img 对象属性，
@@ -177,7 +178,7 @@ def process_location_info(a_list, b_list, gps_data, threshold_minutes=30,
                                     _("写入失败") + f"({retries}/3): {f.filename} - {err_msg}"
                                 )
                     except Exception:
-                        traceback.print_exc()
+                        log_exc()
                     if progress_callback:
                         progress_callback(write_done / write_total * 100, write_done, write_total, _("写入进度"))
                 if moved_files:
@@ -213,7 +214,7 @@ def process_location_info(a_list, b_list, gps_data, threshold_minutes=30,
             match_pool.shutdown(wait=True)
             write_pool.shutdown(wait=True)
         except Exception:
-            traceback.print_exc()
+            log_exc()
 
     # 最终按时间排序两个列表（统一时区后再排序）
     with lock:
@@ -424,6 +425,6 @@ def batch_update_same_location_files(app, target_lat, target_lon, target_alt,
             f.altitude = new_alt
             success += 1
         except Exception:
-            traceback.print_exc()
+            log_exc()
             failed += 1
     return success, failed

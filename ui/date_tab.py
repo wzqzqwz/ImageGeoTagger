@@ -7,7 +7,6 @@ import os
 import platform
 import threading
 import time
-import traceback
 from datetime import datetime
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -24,7 +23,9 @@ from ui.dialogs import (
 )
 from utils.platform_utils import open_file_with_system, show_file_in_explorer
 from utils.recycle_bin import send_to_recycle_bin
+from ui.tk_safe import safe_after
 from utils.i18n import _
+from utils.logging_utils import log_exc
 from services.export_service import csv_safe
 from models.media_file import FileStatus, status_text, status_sort_key
 try:
@@ -404,7 +405,7 @@ class DateTab:
             try:
                 self.app.root.after_cancel(self._rename_after_id)
             except Exception:
-                traceback.print_exc()
+                log_exc()
         self._rename_after_id = self.app.root.after(500, self._on_rename_params_change)
 
     def _apply_column_visibility(self):
@@ -543,7 +544,7 @@ class DateTab:
             try:
                 self.date_tree.delete(item_id)
             except Exception:
-                traceback.print_exc()
+                log_exc()
 
         self._update_preview()
         self.status_var.set(_("就绪 - 共 ") + str(len(self.files_to_process)) + _(" 个文件"))
@@ -600,7 +601,7 @@ class DateTab:
                     try:
                         self.date_tree.delete(item_id)
                     except Exception:
-                        traceback.print_exc()
+                        log_exc()
 
             self._update_preview()
             self.status_var.set(_("已将 ") + str(success) + _(" 个文件移至回收站"))
@@ -610,7 +611,7 @@ class DateTab:
                     self._append_log(_("失败: ") + name + " - " + err + "\n")
             self._pulse_progress()
         except Exception:
-            traceback.print_exc()
+            log_exc()
         finally:
             self.app.release_processing()
 
@@ -850,7 +851,7 @@ class DateTab:
                         try:
                             results.append(fut.result())
                         except Exception:
-                            traceback.print_exc()
+                            log_exc()
                         count += 1
                         if count % 10 == 0 or count == total:
                             pct = count / total * 100 if total else 100
@@ -905,7 +906,7 @@ class DateTab:
             self.app.post_to_ui(lambda r=results: self._append_log(
                 _("扫描完成，共找到 ") + str(len(r)) + _(" 个文件\n")))
         except Exception:
-            traceback.print_exc()
+            log_exc()
             self.app.post_to_ui(
                 lambda: self.status_var.set(_("扫描失败")))
             self.app.post_to_ui(
@@ -1424,7 +1425,7 @@ class DateTab:
                 lambda s=final_success, k=final_skipped, f=final_failed:
                     CompletionDialog(self.app.root, s, k, f))
         except Exception:
-            traceback.print_exc()
+            log_exc()
             self.app.post_to_ui(lambda: self.status_var.set(_("处理失败")))
         finally:
             self._set_ui_processing_state(False)
@@ -1435,7 +1436,7 @@ class DateTab:
         self.progress.config(mode='determinate')
         self.progress_var.set(20)
         for i in range(40, 101, 20):
-            self.app.root.after(int((i - 20) / 80 * 150), lambda v=i: self.progress_var.set(v))
+            safe_after(self.app.root, int((i - 20) / 80 * 150), lambda v=i: self.progress_var.set(v))
 
 
 
@@ -1626,7 +1627,7 @@ class DateTab:
                     fi['manual_edit_date'] = True
                     fi['status'] = FileStatus.DATE_CHANGED
                 except Exception:
-                    traceback.print_exc()
+                    log_exc()
 
     def export_results(self):
         if getattr(self, '_processing', False):

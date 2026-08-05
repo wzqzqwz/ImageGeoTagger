@@ -21,8 +21,8 @@ import tempfile
 import subprocess
 import json
 import threading
-import traceback
 import atexit
+import time
 from collections import deque
 from datetime import datetime, timezone, timedelta
 
@@ -31,6 +31,7 @@ from PIL import Image
 from PIL.ExifTags import TAGS, GPSTAGS
 import piexif
 from utils.i18n import _
+from utils.logging_utils import log_exc
 
 from config import RAW_EXTENSIONS, VIDEO_EXTENSIONS, AUDIO_EXTENSIONS
 from utils.platform_utils import get_startupinfo, get_app_dir
@@ -192,9 +193,22 @@ class _ExifToolPool:
         # 避免空闲回收计时器与命令执行竞争导致进程被杀/孤儿进程泄漏
         self._in_use = 0
         self._in_use_lock = threading.Lock()
-        self.workers = [_StayOpenWorker(tool_path, _system_codepage())
-                        for i in range(size)]
+        self.workers = []
         self._next = 0
+        try:
+            for i in range(size):
+                self.workers.append(_StayOpenWorker(tool_path, _system_codepage()))
+        except Exception:
+            # 部分 worker 启动失败：立即清理已启动的进程，
+            # 否则前序 worker 变成无主的孤儿 perl 进程（构造泄漏）
+            for w in self.workers:
+                try:
+                    w.dead = True
+                    w._kill()
+                except Exception:
+                    pass
+            self.workers = []
+            raise
         atexit.register(self.close)
 
     def run(self, args, timeout=60):
@@ -235,6 +249,11 @@ class _ExifToolPool:
 _pool_lock = threading.Lock()
 _pool_cache = {}
 _pool_idle_timer = None
+# 池创建失败后的重试冷却（秒）：期间直接返回 None，
+# 避免 exiftool 不可用时每次写入都重复构造整个进程池（数十次进程启动）
+_POOL_RETRY_COOLDOWN = 5.0
+# tool_path -> 最近一次池创建失败的时间（monotonic）
+_pool_fail_time = {}
 # 最后一次 exiftool 调用后空闲多久自动关闭常驻进程池
 EXIFTOOL_POOL_IDLE_SECONDS = 30
 
@@ -245,12 +264,18 @@ def _get_pool(tool_path):
         pool = _pool_cache.get(tool_path)
         if pool is not None and not pool.closed:
             return pool
+        last_fail = _pool_fail_time.get(tool_path, 0)
+        if time.monotonic() - last_fail < _POOL_RETRY_COOLDOWN:
+            return None
         try:
             pool = _ExifToolPool(EXIFTOOL_MAX_CONCURRENT, tool_path)
+            _pool_fail_time.pop(tool_path, None)
         except Exception:
-            traceback.print_exc()
+            log_exc('ExifTool 常驻进程池创建失败')
+            _pool_fail_time[tool_path] = time.monotonic()
             pool = None
-        _pool_cache[tool_path] = pool
+        if pool is not None:
+            _pool_cache[tool_path] = pool
         return pool
 
 
@@ -361,7 +386,7 @@ def read_exif_datetime(file_path):
             tags = exifread.process_file(f, details=False)
         return _exif_datetime_from_tags(tags)
     except (OSError, ValueError, KeyError, struct.error):
-        traceback.print_exc()
+        log_exc()
         return None
 
 
@@ -381,7 +406,7 @@ def extract_exif_metadata(file_path):
         with open(file_path, 'rb') as f:
             tags = exifread.process_file(f, details=False)
     except (OSError, ValueError, KeyError, struct.error):
-        traceback.print_exc()
+        log_exc()
         return None, None, None, None
     return _exif_datetime_from_tags(tags), *_gps_from_tags(tags)
 
@@ -465,7 +490,7 @@ def read_quicktime_datetime(file_path):
                     return utc_dt.astimezone().replace(tzinfo=None)
                 search_pos += sub_size
     except (OSError, ValueError, KeyError, struct.error, MemoryError, OverflowError):
-        traceback.print_exc()
+        log_exc()
     return None
 
 
@@ -575,7 +600,7 @@ def _parse_video_time_detailed(time_str):
             except ValueError:
                 continue
     except (OSError, ValueError, KeyError, struct.error):
-        traceback.print_exc()
+        log_exc()
     return None, False
 
 
@@ -653,7 +678,7 @@ def check_exiftool():
             if r.returncode == 0:
                 return True, exiftool_path
         except Exception:
-            traceback.print_exc()
+            log_exc()
     try:
         r = subprocess.run(['exiftool', '-ver'],
                            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -661,7 +686,7 @@ def check_exiftool():
         if r.returncode == 0:
             return True, 'exiftool'
     except Exception:
-        traceback.print_exc()
+        log_exc()
     return False, None
 
 
@@ -741,7 +766,7 @@ def update_image_gps(file_path, location_info):
         shutil.move(temp_path, file_path)
         os.utime(file_path, (orig_atime, orig_mtime))
     except Exception:
-        traceback.print_exc()
+        log_exc()
         _write_gps_with_exiftool(file_path, location_info, orig_atime, orig_mtime)
     finally:
         if os.path.exists(temp_path):
@@ -806,7 +831,7 @@ def _run_exiftool(args, file_path, strict=False):
                 shutil.copy2(backup_path, file_path)
                 restore_ok = True
             except Exception:
-                traceback.print_exc()
+                log_exc()
         # 恢复失败时绝不删除备份：备份是此时唯一的原始副本，删了会永久丢失数据。
         # 将其复制为 原文件名.igt_backup_<时间戳> 保留在原文件同目录，
         # 并在异常信息中附上备份路径，便于用户手动找回。
@@ -817,7 +842,7 @@ def _run_exiftool(args, file_path, strict=False):
                 raise Exception(
                     _("写入失败且原文件恢复失败，已保留备份: ") + keep_name)
             except Exception:
-                traceback.print_exc()
+                log_exc()
                 raise
         raise
     finally:
@@ -896,7 +921,7 @@ def _execute_exiftool(tool_path, args, file_path):
     try:
         pool = _get_pool(tool_path)
     except Exception:
-        traceback.print_exc()
+        log_exc()
     if pool is not None:
         try:
             result = pool.run(cmd_args, timeout=timeout)
@@ -1002,7 +1027,7 @@ def update_video_gps(file_path, location_info):
             success = True
             break
         except Exception:
-            traceback.print_exc()
+            log_exc()
             continue
 
     # 高度独立补写：只有 XMP 组（及标准 GPS 组）支持 GPSAltitude，
@@ -1017,7 +1042,7 @@ def update_video_gps(file_path, location_info):
             ]
             _run_exiftool(alt_method, file_path, strict=True)
         except Exception:
-            traceback.print_exc()
+            log_exc()
 
     if success:
         os.utime(file_path, (orig_atime, orig_mtime))
@@ -1053,7 +1078,7 @@ def update_audio_gps(file_path, location_info):
             success = True
             break
         except Exception:
-            traceback.print_exc()
+            log_exc()
             continue
 
 # 高度独立补写（音频同视频：XMP 组支持 GPSAltitude）
@@ -1064,7 +1089,7 @@ def update_audio_gps(file_path, location_info):
                 f'-XMP:GPSAltitudeRef={"0" if location_info["altitude"] >= 0 else "1"}',
             ], file_path, strict=True)
         except Exception:
-            traceback.print_exc()
+            log_exc()
 
     if success:
         os.utime(file_path, (orig_atime, orig_mtime))
@@ -1141,7 +1166,7 @@ def update_image_date(file_path, new_datetime):
         shutil.move(temp_path, file_path)
         os.utime(file_path, (orig_atime, orig_mtime))
     except Exception:
-        traceback.print_exc()
+        log_exc()
         _write_date_with_exiftool(file_path, new_datetime, orig_atime, orig_mtime)
     finally:
         if os.path.exists(temp_path):
@@ -1190,7 +1215,7 @@ def update_video_date(file_path, new_datetime):
             success = True
             break
         except Exception:
-            traceback.print_exc()
+            log_exc()
             continue
 
     if success:
@@ -1218,7 +1243,7 @@ def update_audio_date(file_path, new_datetime):
             success = True
             break
         except Exception:
-            traceback.print_exc()
+            log_exc()
             continue
 
     if success:
@@ -1304,7 +1329,7 @@ def extract_exif_gps(file_path):
             tags = exifread.process_file(f, details=False)
         return _gps_from_tags(tags)
     except (OSError, ValueError, KeyError, struct.error):
-        traceback.print_exc()
+        log_exc()
         return None, None, None
 
 
@@ -1356,7 +1381,7 @@ def extract_pil_gps(file_path):
                             alt = -alt
                     return lat, lon, alt
     except (OSError, ValueError, KeyError, struct.error, ZeroDivisionError, TypeError):
-        traceback.print_exc()
+        log_exc()
     return None, None, None
 
 
@@ -1416,7 +1441,7 @@ def extract_video_gps_with_exiftool(file_path):
                         video_time = parsed
                         break
                 except (OSError, ValueError, KeyError, struct.error):
-                    traceback.print_exc()
+                    log_exc()
                     continue
 
         if 'Composite:GPSLatitude' in md and 'Composite:GPSLongitude' in md:
@@ -1424,51 +1449,51 @@ def extract_video_gps_with_exiftool(file_path):
                 lat = float(md['Composite:GPSLatitude'])
                 lon = float(md['Composite:GPSLongitude'])
             except (OSError, ValueError, KeyError, struct.error):
-                traceback.print_exc()
+                log_exc()
         elif 'QuickTime:GPSCoordinates' in md:
             try:
                 c = md['QuickTime:GPSCoordinates'].split(',')
                 if len(c) >= 2:
                     lat, lon = float(c[0]), float(c[1])
             except (OSError, ValueError, KeyError, struct.error):
-                traceback.print_exc()
+                log_exc()
         elif 'XMP:GPSLatitude' in md and 'XMP:GPSLongitude' in md:
             try:
                 lat, lon = float(md['XMP:GPSLatitude']), float(md['XMP:GPSLongitude'])
             except (OSError, ValueError, KeyError, struct.error):
-                traceback.print_exc()
+                log_exc()
         elif 'Keys:GPSCoordinates' in md:
             try:
                 c = md['Keys:GPSCoordinates'].split(',')
                 if len(c) >= 2:
                     lat, lon = float(c[0]), float(c[1])
             except (OSError, ValueError, KeyError, struct.error):
-                traceback.print_exc()
+                log_exc()
         elif 'UserData:GPSCoordinates' in md:
             try:
                 c = md['UserData:GPSCoordinates'].split(',')
                 if len(c) >= 2:
                     lat, lon = float(c[0]), float(c[1])
             except (OSError, ValueError, KeyError, struct.error):
-                traceback.print_exc()
+                log_exc()
 
         if 'Composite:GPSAltitude' in md:
             try:
                 alt = float(md['Composite:GPSAltitude'])
             except (OSError, ValueError, KeyError, struct.error):
-                traceback.print_exc()
+                log_exc()
         elif 'XMP:GPSAltitude' in md:
             try:
                 alt = float(md['XMP:GPSAltitude'])
             except (OSError, ValueError, KeyError, struct.error):
-                traceback.print_exc()
+                log_exc()
         elif 'QuickTime:GPSAltitude' in md:
             try:
                 alt = float(md['QuickTime:GPSAltitude'])
             except (OSError, ValueError, KeyError, struct.error):
-                traceback.print_exc()
+                log_exc()
 
         return lat, lon, alt, video_time
     except (OSError, ValueError, KeyError, struct.error):
-        traceback.print_exc()
+        log_exc()
         return None, None, None, None
