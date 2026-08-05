@@ -215,10 +215,12 @@ class MainWindow:
                         win.destroy()
                 except Exception:
                     pass
+            self._closing = True
             self.root.destroy()
         except Exception:
             traceback.print_exc()
             try:
+                self._closing = True
                 self.root.destroy()
             except Exception:
                 pass

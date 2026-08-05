@@ -484,6 +484,7 @@
   "选中轨迹点: ": "Selected Points: ",
   "部分失败": "Partial Failure",
   "重命名失败": "Rename failed",
+  "重命名失败: ": "Rename failed: ",
   "重命名失败（可能跨分区），请使用复制后删除的方式": "Rename failed (cross-partition?), use copy+delete instead",
   "重命名失败（无法生成唯一文件名）": "Rename failed (could not generate unique filename)",
   "重命名成功": "Renamed successfully",

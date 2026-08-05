@@ -484,6 +484,7 @@
   "选中轨迹点: ": "Puntos seleccionados: ",
   "部分失败": "Fallo parcial",
   "重命名失败": "Renombrado fallido",
+  "重命名失败: ": "Error al renombrar: ",
   "重命名失败（可能跨分区），请使用复制后删除的方式": "Fallo (cross-partition?), copie+borrado",
   "重命名失败（无法生成唯一文件名）": "Fallo (no se puede generar nombre único)",
   "重命名成功": "Renombrado exitosamente",

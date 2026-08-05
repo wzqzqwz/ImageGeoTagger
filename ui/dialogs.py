@@ -1188,8 +1188,9 @@ class BatchDateEditDialog:
                     traceback.print_exc()
                 finally:
                     # 主窗口已销毁导致 poll 停止轮询时，在此兜底释放互斥锁，
-                    # 避免全局锁被永久占用
-                    if not self._root_alive():
+                    # 避免全局锁被永久占用（_app_closing 为纯 Python 标志，
+                    # 工作线程安全；不得用 _root_alive 的 winfo_exists）
+                    if self._app_closing():
                         self._release_if_acquired()
 
             prog_thread = threading.Thread(target=process, daemon=True)
@@ -1286,6 +1287,14 @@ class BatchDateEditDialog:
             return bool(self.app.root.winfo_exists())
         except Exception:
             return False
+
+    def _app_closing(self):
+        """主窗口是否已进入关闭流程（纯 Python 标志，可在工作线程安全调用）
+
+        与 _root_alive 不同：_root_alive 调用 winfo_exists 属于 Tk 解释器
+        调用，只能在主线程使用；工作线程判断主窗口状态必须用本方法。
+        """
+        return bool(getattr(self.app, '_closing', False))
 
     def _apply_moves(self, moved_files, new_dt):
         """主线程加锁回填批量日期写入结果到内存对象
@@ -1405,6 +1414,10 @@ class BatchLocationEditDialog:
             return bool(self.app.root.winfo_exists())
         except Exception:
             return False
+
+    def _app_closing(self):
+        """主窗口是否已进入关闭流程（纯 Python 标志，可在工作线程安全调用）"""
+        return bool(getattr(self.app, '_closing', False))
 
     def _parse_coordinates(self, content):
         return _parse_coordinates(content)
@@ -1555,7 +1568,8 @@ class BatchLocationEditDialog:
                 self.app.post_to_ui(self._release_if_acquired)
             finally:
                 # 主窗口已销毁导致 post_to_ui 回调不再执行时，兜底释放互斥锁
-                if not self._root_alive():
+                # （_app_closing 为纯 Python 标志，工作线程安全）
+                if self._app_closing():
                     self._release_if_acquired()
 
         t = threading.Thread(target=process, daemon=True)
