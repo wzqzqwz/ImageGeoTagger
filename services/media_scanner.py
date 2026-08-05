@@ -16,8 +16,7 @@ from config import (
     VIDEO_EXTENSIONS, AUDIO_EXTENSIONS, ALL_MEDIA_EXTENSIONS
 )
 from utils.exif_utils import (
-    extract_exif_gps, extract_pil_gps, extract_video_gps_with_exiftool,
-    read_exif_datetime, read_quicktime_datetime
+    extract_exif_metadata, extract_pil_gps, extract_video_gps_with_exiftool
 )
 from utils.gpx_utils import parse_gpx_file
 from utils.media_utils import get_file_creation_datetime
@@ -169,11 +168,10 @@ def _extract_file_info(file_path, only_process_with_date=False):
             return info
         return info
 
-    # 图像文件 - 优先用 exifread 库，再回退到 Pillow
-    dt = read_exif_datetime(file_path)
+    # 图像文件 - 一次解析 EXIF 同时提取日期与 GPS（避免对同一文件重复解析）
+    dt, lat, lon, alt = extract_exif_metadata(file_path)
     info.dt = dt
 
-    lat, lon, alt = extract_exif_gps(file_path)
     if lat is not None and lon is not None:
         info.latitude = lat
         info.longitude = lon

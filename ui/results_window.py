@@ -4,7 +4,7 @@ import tkinter as tk
 from tkinter import ttk
 from ui import custom_msgbox as messagebox
 import platform
-import os
+import threading
 import traceback
 from datetime import datetime
 
@@ -191,7 +191,6 @@ class ResultsWindow:
                     tree.heading(col, text=txt)
 
         def apply_current_sort():
-            nonlocal filtered_data
             if sort_column:
                 filtered_data.sort(key=lambda x: _get_sort_key(x, sort_column),
                                    reverse=sort_reverse)
@@ -199,6 +198,10 @@ class ResultsWindow:
 
         def on_sort_column(col):
             nonlocal sort_column, sort_reverse
+            # 序号列没有稳定排序键（_get_sort_key 恒为 0），
+            # 点击只会抖动行序，直接忽略
+            if col == 'seq':
+                return
             if sort_column == col:
                 sort_reverse = not sort_reverse
             else:
@@ -350,14 +353,18 @@ class ResultsWindow:
                 menu.add_command(label=_("从磁盘中删除"),
                                  command=lambda: self._delete_items(tree, sel, filtered_data))
                 menu.add_separator()
+                # 菜单创建时一次性解析文件对象：sel 里的 iid 可能在后续
+                # 增删/刷新后失效（tree.index 抛 TclError），延迟到点击时
+                # 再解析会导致对象列表为空或错位
+                sel_objs = self._resolve_items(tree, sel, filtered_data)
                 menu.add_command(
                     label=_("批量修改拍摄日期"),
-                    command=lambda: BatchDateEditDialog(
-                        self.app, [filtered_data[tree.index(s)] for s in sel], tree))
+                    command=lambda objs=sel_objs: BatchDateEditDialog(
+                        self.app, objs, tree))
                 menu.add_command(
                     label=_("批量修改位置信息"),
-                    command=lambda: BatchLocationEditDialog(
-                        self.app, [filtered_data[tree.index(s)] for s in sel], tree))
+                    command=lambda objs=sel_objs: BatchLocationEditDialog(
+                        self.app, objs, tree))
 
             try:
                 menu.tk_popup(event.x_root, event.y_root)
@@ -389,12 +396,20 @@ class ResultsWindow:
         tree.sync_search = sync_search
         self._tab_trees[tab_type] = tree
 
-    def _remove_items(self, tree, selected_items, filtered_data):
+    def _resolve_items(self, tree, selected_items, filtered_data):
         items = []
         for item_id in selected_items:
-            idx = tree.index(item_id)
+            try:
+                idx = tree.index(item_id)
+            except tk.TclError:
+                # 行已随上次刷新失效：跳过，不再让整个操作静默失败
+                continue
             if 0 <= idx < len(filtered_data):
                 items.append(filtered_data[idx])
+        return items
+
+    def _remove_items(self, tree, selected_items, filtered_data):
+        items = self._resolve_items(tree, selected_items, filtered_data)
 
         if not items:
             return
@@ -419,11 +434,7 @@ class ResultsWindow:
                                          self.progress_label.config(text=_("已从序列中删除 ") + str(len(items)) + _(" 个文件"))))
 
     def _delete_items(self, tree, selected_items, filtered_data):
-        items = []
-        for item_id in selected_items:
-            idx = tree.index(item_id)
-            if 0 <= idx < len(filtered_data):
-                items.append(filtered_data[idx])
+        items = self._resolve_items(tree, selected_items, filtered_data)
 
         if not items:
             return
@@ -440,10 +451,20 @@ class ResultsWindow:
         if not self.app.acquire_processing():
             messagebox.showwarning(_("警告"), _("其他任务正在处理中，请等待完成"), parent=self.window)
             return
-        try:
-            paths = [i.path for i in items if hasattr(i, 'path')]
+        paths = [i.path for i in items if hasattr(i, 'path')]
+
+        def worker():
             success, failed = send_to_recycle_bin(paths)
-            failed_paths = set(f[0] for f in failed) if failed else set()
+            self.app.post_to_ui(
+                lambda s=success, f=failed: self._apply_delete_results(items, s, f))
+
+        thread = threading.Thread(target=worker, daemon=True)
+        self.app.register_thread(thread)
+        thread.start()
+
+    def _apply_delete_results(self, items, success, failed):
+        try:
+            failed_paths = set(p for p, _ in failed) if failed else set()
 
             with self.app.lock:
                 for item in items:
@@ -724,12 +745,19 @@ class ResultsWindow:
                 selected_keys.append((vals[2], vals[3], vals[4], vals[1]))
 
         def _key(d):
-            t = d.get('datetime', '')
+            # gpx_data_list 是 dict，self.app.gps_data 是 GpsPoint 对象，两种都要兼容
+            if hasattr(d, 'timestamp'):
+                t = d.timestamp
+                lat, lon = d.latitude, d.longitude
+                src = d.source_file or ''
+            else:
+                t = d.get('datetime', '')
+                lat, lon = d.get('latitude'), d.get('longitude')
+                src = d.get('source_file', '') or ''
             if hasattr(t, 'strftime'):
                 t = t.strftime('%Y-%m-%d %H:%M:%S')
-            lat = format_gps_coord(d.get('latitude')) if d.get('latitude') is not None else ''
-            lon = format_gps_coord(d.get('longitude')) if d.get('longitude') is not None else ''
-            src = d.get('source_file', '') or ''
+            lat = format_gps_coord(lat) if lat is not None else ''
+            lon = format_gps_coord(lon) if lon is not None else ''
             return (t, lat, lon, src)
 
         def _remove_first_matching(lst, key):

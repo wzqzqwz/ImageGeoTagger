@@ -14,6 +14,9 @@ from utils.media_utils import format_gps_coord
 def _get_val(item, key, default=None):
     if isinstance(item, Mapping):
         return item.get(key, default)
+    # GpsPoint 的时间字段名是 timestamp（而非 datetime），统一兼容
+    if key == 'datetime' and not hasattr(item, 'datetime') and hasattr(item, 'timestamp'):
+        return getattr(item, 'timestamp', default)
     return getattr(item, key, default)
 
 
@@ -59,7 +62,7 @@ def export_to_txt(filepath, a_list, b_list, gps_data, stats_text):
                     f.write(_("   位置: ") + f"({lat:.8f}, {lon:.8f})")
                     alt = _get_val(point, 'altitude')
                     if alt is not None:
-                        f.write(f", " + _("高度: ") + f"{alt:.2f}m")
+                        f.write(", " + _("高度: ") + f"{alt:.2f}m")
                     f.write("\n")
                 f.write(_("   来源: ") + _get_val(point, 'source_file', _('未知')) + "\n\n")
 
@@ -79,7 +82,7 @@ def _write_file_info_txt(f, i, item):
     if lat is not None and lon is not None:
         f.write(_("   位置: ") + f"({lat:.8f}, {lon:.8f})")
         if alt is not None:
-            f.write(f", " + _("高度: ") + f"{alt:.2f}m")
+            f.write(", " + _("高度: ") + f"{alt:.2f}m")
         f.write("\n")
     if fsize is not None:
         f.write(_("   大小: ") + f"{fsize / (1024 * 1024):.2f} MB\n")
@@ -89,7 +92,7 @@ def _write_file_info_txt(f, i, item):
 
 
 def export_to_csv(filepath, a_list, b_list):
-    with open(filepath, 'w', newline='', encoding='utf-8') as f:
+    with open(filepath, 'w', newline='', encoding='utf-8-sig') as f:
         writer = csv.writer(f)
         writer.writerow([_('文件名'), _('文件路径'), _('拍摄时间'), _('纬度'),
                         _('经度'), _('高度(米)'), _('文件大小(MB)'), _('是否有位置信息')])

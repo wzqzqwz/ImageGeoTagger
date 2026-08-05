@@ -3,7 +3,6 @@
 import json
 import locale
 import os
-import platform
 
 _TRANSLATIONS = {}
 _CURRENT_LANG = 'zh'

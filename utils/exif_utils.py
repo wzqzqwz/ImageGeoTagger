@@ -14,7 +14,6 @@
 """
 
 import os
-import sys
 import platform
 import struct
 import shutil
@@ -23,11 +22,9 @@ import subprocess
 import json
 import threading
 import traceback
-import time
 import atexit
 from collections import deque
 from datetime import datetime, timezone, timedelta
-from pathlib import Path
 
 import exifread
 from PIL import Image
@@ -69,6 +66,8 @@ class _StayOpenWorker:
         self.lock = threading.Lock()
         self.dead = False
         self._stderr_lines = deque()
+        # 已从队首丢弃的 stderr 行数（配合 _stderr_lines 还原真实序号）
+        self._stderr_trimmed = 0
         self._start()
 
     # ---------- 进程生命周期 ----------
@@ -89,6 +88,10 @@ class _StayOpenWorker:
                 if not line:
                     break
                 self._stderr_lines.append(line.decode(enc, errors='replace'))
+                # 只保留最近 2 万行：长会话大量 Warning 时避免内存无界增长
+                while len(self._stderr_lines) > 20000:
+                    self._stderr_lines.popleft()
+                    self._stderr_trimmed += 1
         except Exception:
             pass
 
@@ -106,6 +109,7 @@ class _StayOpenWorker:
         self._kill()
         self.dead = False
         self._stderr_lines.clear()
+        self._stderr_trimmed = 0
         self._start()
 
     # ---------- 命令执行 ----------
@@ -115,7 +119,7 @@ class _StayOpenWorker:
         watchdog.daemon = True
         watchdog.start()
         try:
-            stderr_start = len(self._stderr_lines)
+            stderr_start_total = self._stderr_trimmed + len(self._stderr_lines)
             data = ''.join(a + '\n' for a in args) + '-execute\n'
             self.proc.stdin.write(data.encode(enc, errors='replace'))
             self.proc.stdin.flush()
@@ -129,8 +133,15 @@ class _StayOpenWorker:
                 if '{ready}' in text:
                     break
                 out_parts.append(text)
-            stderr_text = ''.join(
-                list(self._stderr_lines)[stderr_start:]).rstrip('\n')
+            # 取最近 lines_this_cmd 行：队列可能已被超限清理截断队首，
+            # 但本命令自身的 stderr 必然位于队尾，取尾部即可正确还原
+            lines_this_cmd = (self._stderr_trimmed + len(self._stderr_lines)) - stderr_start_total
+            texts = list(self._stderr_lines)
+            if lines_this_cmd > 0:
+                stderr_text = ''.join(
+                    texts[max(0, len(texts) - lines_this_cmd):]).rstrip('\n')
+            else:
+                stderr_text = ''
             return ''.join(out_parts), stderr_text
         finally:
             watchdog.cancel()
@@ -177,26 +188,40 @@ class _ExifToolPool:
         self.closed = False
         self._sem = threading.BoundedSemaphore(size)
         self._lock = threading.Lock()
+        # 正在执行的命令数：close 时若 >0 说明有命令在途，推迟关闭，
+        # 避免空闲回收计时器与命令执行竞争导致进程被杀/孤儿进程泄漏
+        self._in_use = 0
+        self._in_use_lock = threading.Lock()
         self.workers = [_StayOpenWorker(tool_path, _system_codepage())
-                        for _ in range(size)]
+                        for i in range(size)]
         self._next = 0
         atexit.register(self.close)
 
     def run(self, args, timeout=60):
         with self._sem:
-            with self._lock:
-                worker = None
-                for _ in range(self.size):
-                    w = self.workers[self._next]
-                    self._next = (self._next + 1) % self.size
-                    if not w.dead:
-                        worker = w
-                        break
-                if worker is None:
-                    raise _PoolExecutionError(_("ExifTool 常驻进程池全部失效"))
-            return worker.run(args, timeout)
+            with self._in_use_lock:
+                self._in_use += 1
+            try:
+                with self._lock:
+                    worker = None
+                    for i in range(self.size):
+                        w = self.workers[self._next]
+                        self._next = (self._next + 1) % self.size
+                        if not w.dead:
+                            worker = w
+                            break
+                    if worker is None:
+                        raise _PoolExecutionError(_("ExifTool 常驻进程池全部失效"))
+                return worker.run(args, timeout)
+            finally:
+                with self._in_use_lock:
+                    self._in_use -= 1
 
     def close(self):
+        """关闭全部常驻进程；有命令在途时返回 False（由调用方延后重试）"""
+        with self._in_use_lock:
+            if self._in_use > 0:
+                return False
         self.closed = True
         for w in getattr(self, 'workers', []):
             try:
@@ -204,6 +229,7 @@ class _ExifToolPool:
                 w._kill()
             except Exception:
                 pass
+        return True
 
 
 _pool_lock = threading.Lock()
@@ -233,18 +259,28 @@ def close_exiftool_pool():
 
     任务执行完毕后调用；下次任何写入任务开始时 _get_pool 会自动重建。
     供外部任务收尾调用，也由空闲计时器自动触发。
+    若关闭时仍有命令在途（空闲回收与执行竞争的竞态），
+    保留该池并推迟到下一个空闲周期再关闭。
     """
     global _pool_cache, _pool_idle_timer
     with _pool_lock:
         if _pool_idle_timer is not None:
             _pool_idle_timer.cancel()
             _pool_idle_timer = None
-        for pool in _pool_cache.values():
-            try:
-                pool.close()
-            except Exception:
-                traceback.print_exc()
-        _pool_cache = {}
+        still_busy = {}
+        for path, pool in _pool_cache.items():
+            if pool.close():
+                continue
+            still_busy[path] = pool
+        if still_busy:
+            # 有命令在途：池保持可用（closed=False），空闲周期结束后再关
+            _pool_cache = still_busy
+            t = threading.Timer(EXIFTOOL_POOL_IDLE_SECONDS, close_exiftool_pool)
+            t.daemon = True
+            _pool_idle_timer = t
+            t.start()
+        else:
+            _pool_cache = {}
 
 
 def _arm_pool_idle_close():
@@ -287,6 +323,24 @@ def _now_str():
     return datetime.now().strftime('%Y%m%d-%H%M%S')
 
 
+def _exif_datetime_from_tags(tags):
+    """从 exifread 解析出的 tags 中提取拍摄日期
+
+    Returns:
+        datetime or None: 解析成功返回 datetime 对象，失败返回 None
+    """
+    for tag in ['EXIF DateTimeOriginal', 'Image DateTime', 'EXIF DateTimeDigitized']:
+        if tag in tags:
+            dt_str = str(tags[tag])
+            if dt_str.strip():
+                for fmt in ['%Y:%m:%d %H:%M:%S', '%Y-%m-%d %H:%M:%S']:
+                    try:
+                        return datetime.strptime(dt_str, fmt)
+                    except ValueError:
+                        continue
+    return None
+
+
 def read_exif_datetime(file_path):
     """读取图像文件的 EXIF 拍摄日期
 
@@ -300,25 +354,36 @@ def read_exif_datetime(file_path):
 
     Returns:
         datetime or None: 解析成功返回 datetime 对象，失败返回 None
-        如果 EXIF 中存在日期标签但解析失败，返回 datetime.min
+        如果 EXIF 中存在日期标签但解析失败，返回 None
     """
     try:
         with open(file_path, 'rb') as f:
             tags = exifread.process_file(f, details=False)
-            for tag in ['EXIF DateTimeOriginal', 'Image DateTime', 'EXIF DateTimeDigitized']:
-                if tag in tags:
-                    dt_str = str(tags[tag])
-                    if dt_str.strip():
-                        for fmt in ['%Y:%m:%d %H:%M:%S', '%Y-%m-%d %H:%M:%S']:
-                            try:
-                                return datetime.strptime(dt_str, fmt)
-                            except ValueError:
-                                continue
-            # 如果存在日期标签但格式无法解析，返回 None
-            return None
+        return _exif_datetime_from_tags(tags)
     except (OSError, ValueError, KeyError, struct.error):
         traceback.print_exc()
         return None
+
+
+def extract_exif_metadata(file_path):
+    """一次解析 EXIF 同时提取拍摄日期与 GPS 坐标
+
+    扫描阶段对同一图像文件只解析一次 EXIF，
+    避免 read_exif_datetime + extract_exif_gps 各自打开文件重复解析。
+
+    Args:
+        file_path: 文件路径
+
+    Returns:
+        tuple: (拍摄日期, 纬度, 经度, 高度)，失败返回 (None, None, None, None)
+    """
+    try:
+        with open(file_path, 'rb') as f:
+            tags = exifread.process_file(f, details=False)
+    except (OSError, ValueError, KeyError, struct.error):
+        traceback.print_exc()
+        return None, None, None, None
+    return _exif_datetime_from_tags(tags), *_gps_from_tags(tags)
 
 
 def read_quicktime_datetime(file_path):
@@ -399,7 +464,7 @@ def read_quicktime_datetime(file_path):
                     utc_dt = (datetime(1904, 1, 1) + timedelta(seconds=qt_time)).replace(tzinfo=timezone.utc)
                     return utc_dt.astimezone().replace(tzinfo=None)
                 search_pos += sub_size
-    except (OSError, ValueError, KeyError, struct.error, MemoryError, OverflowError) as e:
+    except (OSError, ValueError, KeyError, struct.error, MemoryError, OverflowError):
         traceback.print_exc()
     return None
 
@@ -460,17 +525,14 @@ def to_degrees(value):
     return ((d, 1), (m, 1), (s, DEN))
 
 
-def parse_video_time(time_str):
-    """解析视频文件的时间字符串（自动处理 UTC 到本地时间的转换）
-
-    视频文件通常使用 UTC 时间存储（带 Z 后缀），
-    此函数会自动将其转换为本地时区。
-
-    Args:
-        time_str: 时间字符串（支持多种格式，可能带 Z 后缀）
+def _parse_video_time_detailed(time_str):
+    """解析视频时间字符串，返回 (datetime 或 None, 是否含时区信息)
 
     Returns:
-        datetime or None: 本地时间
+        tuple: (datetime 或 None, bool)
+            bool 为 True 表示输入带时区信息（Z 后缀/UTC/±HH:MM），
+            返回值已是本地时区 naive 时间；False 表示输入为无时区
+            裸时间，未经任何转换。
     """
     try:
         common_formats = [
@@ -499,7 +561,7 @@ def parse_video_time(time_str):
         for fmt in offset_formats:
             try:
                 aware = datetime.strptime(time_str.strip(), fmt)
-                return aware.astimezone().replace(tzinfo=None)
+                return aware.astimezone().replace(tzinfo=None), True
             except ValueError:
                 continue
 
@@ -508,13 +570,29 @@ def parse_video_time(time_str):
                 parsed = datetime.strptime(time_str, fmt.replace('Z', ''))
                 if is_utc:
                     utc_time = parsed.replace(tzinfo=timezone.utc)
-                    return utc_time.astimezone().replace(tzinfo=None)
-                return parsed
+                    return utc_time.astimezone().replace(tzinfo=None), True
+                return parsed, False
             except ValueError:
                 continue
     except (OSError, ValueError, KeyError, struct.error):
         traceback.print_exc()
-    return None
+    return None, False
+
+
+def parse_video_time(time_str):
+    """解析视频文件的时间字符串（自动处理 UTC 到本地时间的转换）
+
+    视频文件通常使用 UTC 时间存储（带 Z 后缀），
+    此函数会自动将其转换为本地时区。
+
+    Args:
+        time_str: 时间字符串（支持多种格式，可能带 Z 后缀）
+
+    Returns:
+        datetime or None: 本地时间
+    """
+    dt, _ = _parse_video_time_detailed(time_str)
+    return dt
 
 
 def get_exiftool_path():
@@ -776,19 +854,42 @@ def _make_backup(file_path):
     raise Exception(_("无法创建原文件备份，已中止写入: ") + str(file_path))
 
 
+def _write_timeout_for(file_path):
+    """按文件大小估算 ExifTool 重写超时（秒）
+
+    固定 60s 对数百 MB 以上的视频/RAW 不够：ExifTool 写元数据要整文件
+    重写，慢盘上可能超时被误杀（池模式看门狗会杀进程触发备份恢复）。
+    按 ~20MB/s 保守估算，256MB 以下保持 60s，封顶 15 分钟。
+    """
+    try:
+        size = os.path.getsize(file_path)
+    except OSError:
+        return 60
+    if size <= 256 * 1024 * 1024:
+        return 60
+    return min(900, 60 + size // (20 * 1024 * 1024))
+
+
 def _execute_exiftool(tool_path, args, file_path):
     """执行 ExifTool 写入命令，返回 (stdout_text, stderr_text)
 
     优先常驻进程池；池执行层故障（进程超时/退出等）时回退到独立进程模式。
     """
     cmd_args = ['-overwrite_original', '-P', *args, file_path]
+    timeout = _write_timeout_for(file_path)
 
     def run_independent():
         with _exiftool_semaphore:
             r = subprocess.run([tool_path, *cmd_args],
                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                               text=True, timeout=60, startupinfo=get_startupinfo(),
+                               text=True, timeout=timeout, startupinfo=get_startupinfo(),
                                errors='replace')
+            # 非 0 返回码视为执行层故障（崩溃/被强杀），由调用方回退/抛错，
+            # 避免文本校验把"进程异常退出"误判为写入成功
+            if r.returncode != 0:
+                raise _PoolExecutionError(
+                    _("ExifTool 执行失败（退出码 ") + str(r.returncode) + "): "
+                    + (r.stderr or "").strip()[:200])
             return r.stdout, r.stderr
 
     pool = None
@@ -798,7 +899,7 @@ def _execute_exiftool(tool_path, args, file_path):
         traceback.print_exc()
     if pool is not None:
         try:
-            result = pool.run(cmd_args)
+            result = pool.run(cmd_args, timeout=timeout)
             # 每次成功使用后重置空闲计时器，任务结束自动回收进程
             _arm_pool_idle_close()
             return result
@@ -826,7 +927,10 @@ def _validate_exiftool_result(stdout_text, stderr_text, strict, file_path, tool_
                 tool_path, ['-charset', 'filename=cp' + str(_system_codepage())] + list(args), file_path)
             if ("Error" in (err2 or "") or "not yet supported" in (err2 or "")) \
                     or "FileName encoding must be specified" in (err2 or ""):
-                raise Exception(_("文件名包含非ASCII字符，处理失败"))
+                if "FileName encoding must be specified" in (err2 or ""):
+                    raise Exception(_("文件名包含非ASCII字符，处理失败"))
+                # 重试后仍有其它真实错误（如格式不支持）：透传实际错误信息
+                raise Exception((err2 or "").strip()[:500])
             return
         if "not yet supported" in stderr:
             ext = os.path.splitext(file_path)[1].lower()
@@ -867,7 +971,6 @@ def update_video_gps(file_path, location_info):
         location_info: 包含 latitude, longitude, altitude 的字典
     """
     orig_atime, orig_mtime = _get_stat(file_path)
-    ext = os.path.splitext(file_path)[1].lower()
 
     # 尝试五种不同的写入方法，支持不同视频格式的元数据容器。
     # 只有 lat/lon 参与容器探测；高度单独用 XMP 组补写（见下），
@@ -1151,6 +1254,39 @@ def clear_video_date(file_path):
     os.utime(file_path, (orig_atime, orig_mtime))
 
 
+def _gps_from_tags(tags):
+    """从 exifread 解析出的 tags 中提取 GPS 坐标（度/分/秒转十进制度数）"""
+    lat = lon = alt = None
+    if 'GPS GPSLatitude' in tags and 'GPS GPSLongitude' in tags:
+        lat = _ratio_deg_to_float(tags['GPS GPSLatitude'].values)
+        lon = _ratio_deg_to_float(tags['GPS GPSLongitude'].values)
+        if lat is not None and 'GPS GPSLatitudeRef' in tags and str(tags['GPS GPSLatitudeRef']) == 'S':
+            lat = -lat
+        if lon is not None and 'GPS GPSLongitudeRef' in tags and str(tags['GPS GPSLongitudeRef']) == 'W':
+            lon = -lon
+
+    if 'GPS GPSAltitude' in tags:
+        try:
+            vals = tags['GPS GPSAltitude'].values
+            v = vals[0] if vals else None
+            if v is not None:
+                if hasattr(v, "num"):
+                    # exifread 的 Ratio 继承 Fraction，0/0 时 num/den 均为 0，
+                    # float(v) 会抛 ZeroDivisionError，必须显式防护
+                    den = float(getattr(v, 'den', 1))
+                    alt = float(v.num) / den if den != 0 else None
+                else:
+                    alt = float(v)
+                if alt is not None and 'GPS GPSAltitudeRef' in tags:
+                    refs = tags['GPS GPSAltitudeRef'].values
+                    if refs and refs[0] == 1:
+                        alt = -alt
+        except (AttributeError, IndexError, ValueError, ZeroDivisionError, TypeError):
+            alt = None
+
+    return lat, lon, alt
+
+
 def extract_exif_gps(file_path):
     """使用 exifread 库从图像文件中提取 GPS 数据
 
@@ -1166,37 +1302,8 @@ def extract_exif_gps(file_path):
     try:
         with open(file_path, 'rb') as f:
             tags = exifread.process_file(f, details=False)
-
-        lat = lon = alt = None
-        if 'GPS GPSLatitude' in tags and 'GPS GPSLongitude' in tags:
-            lat = _ratio_deg_to_float(tags['GPS GPSLatitude'].values)
-            lon = _ratio_deg_to_float(tags['GPS GPSLongitude'].values)
-            if lat is not None and 'GPS GPSLatitudeRef' in tags and str(tags['GPS GPSLatitudeRef']) == 'S':
-                lat = -lat
-            if lon is not None and 'GPS GPSLongitudeRef' in tags and str(tags['GPS GPSLongitudeRef']) == 'W':
-                lon = -lon
-
-        if 'GPS GPSAltitude' in tags:
-            try:
-                vals = tags['GPS GPSAltitude'].values
-                v = vals[0] if vals else None
-                if v is not None:
-                    if hasattr(v, "num"):
-                        # exifread 的 Ratio 继承 Fraction，0/0 时 num/den 均为 0，
-                        # float(v) 会抛 ZeroDivisionError，必须显式防护
-                        den = float(getattr(v, 'den', 1))
-                        alt = float(v.num) / den if den != 0 else None
-                    else:
-                        alt = float(v)
-                    if alt is not None and 'GPS GPSAltitudeRef' in tags:
-                        refs = tags['GPS GPSAltitudeRef'].values
-                        if refs and refs[0] == 1:
-                            alt = -alt
-            except (AttributeError, IndexError, ValueError, ZeroDivisionError, TypeError):
-                alt = None
-
-        return lat, lon, alt
-    except (OSError, ValueError, KeyError, struct.error) as e:
+        return _gps_from_tags(tags)
+    except (OSError, ValueError, KeyError, struct.error):
         traceback.print_exc()
         return None, None, None
 
@@ -1280,7 +1387,14 @@ def extract_video_gps_with_exiftool(file_path):
         if r.returncode != 0:
             return None, None, None, None
 
-        md = json.loads(r.stdout)[0]
+        try:
+            md_list = json.loads(r.stdout)
+        except (ValueError, TypeError):
+            # 空输出/非 JSON 输出（如损坏视频）→ 无法提取，返回 None 而非崩溃
+            return None, None, None, None
+        if not isinstance(md_list, list) or not md_list or not isinstance(md_list[0], dict):
+            return None, None, None, None
+        md = md_list[0]
         lat = lon = alt = None
         video_time = None
 
@@ -1290,15 +1404,18 @@ def extract_video_gps_with_exiftool(file_path):
             if dtkey in md and video_time is None:
                 try:
                     raw = md[dtkey]
-                    parsed = parse_video_time(raw)
+                    parsed, had_tz = _parse_video_time_detailed(raw)
                     if parsed:
-                        # QuickTime 时间始终为 UTC（即使 ExifTool 输出不带 Z 后缀）
-                        if dtkey.startswith('QuickTime:') and parsed.tzinfo is None:
+                        # QuickTime 时间始终为 UTC（即使 ExifTool 输出不带 Z 后缀）。
+                        # 仅当原始字符串不含任何时区信息时按 UTC 转换；
+                        # 若已带 Z/±HH:MM，_parse_video_time_detailed 已转成本地时间，
+                        # 再转一次会导致偏移重复
+                        if dtkey.startswith('QuickTime:') and not had_tz:
                             utc_dt = parsed.replace(tzinfo=timezone.utc)
                             parsed = utc_dt.astimezone().replace(tzinfo=None)
                         video_time = parsed
                         break
-                except (OSError, ValueError, KeyError, struct.error) as e:
+                except (OSError, ValueError, KeyError, struct.error):
                     traceback.print_exc()
                     continue
 
@@ -1306,52 +1423,52 @@ def extract_video_gps_with_exiftool(file_path):
             try:
                 lat = float(md['Composite:GPSLatitude'])
                 lon = float(md['Composite:GPSLongitude'])
-            except (OSError, ValueError, KeyError, struct.error) as e:
+            except (OSError, ValueError, KeyError, struct.error):
                 traceback.print_exc()
         elif 'QuickTime:GPSCoordinates' in md:
             try:
                 c = md['QuickTime:GPSCoordinates'].split(',')
                 if len(c) >= 2:
                     lat, lon = float(c[0]), float(c[1])
-            except (OSError, ValueError, KeyError, struct.error) as e:
+            except (OSError, ValueError, KeyError, struct.error):
                 traceback.print_exc()
         elif 'XMP:GPSLatitude' in md and 'XMP:GPSLongitude' in md:
             try:
                 lat, lon = float(md['XMP:GPSLatitude']), float(md['XMP:GPSLongitude'])
-            except (OSError, ValueError, KeyError, struct.error) as e:
+            except (OSError, ValueError, KeyError, struct.error):
                 traceback.print_exc()
         elif 'Keys:GPSCoordinates' in md:
             try:
                 c = md['Keys:GPSCoordinates'].split(',')
                 if len(c) >= 2:
                     lat, lon = float(c[0]), float(c[1])
-            except (OSError, ValueError, KeyError, struct.error) as e:
+            except (OSError, ValueError, KeyError, struct.error):
                 traceback.print_exc()
         elif 'UserData:GPSCoordinates' in md:
             try:
                 c = md['UserData:GPSCoordinates'].split(',')
                 if len(c) >= 2:
                     lat, lon = float(c[0]), float(c[1])
-            except (OSError, ValueError, KeyError, struct.error) as e:
+            except (OSError, ValueError, KeyError, struct.error):
                 traceback.print_exc()
 
         if 'Composite:GPSAltitude' in md:
             try:
                 alt = float(md['Composite:GPSAltitude'])
-            except (OSError, ValueError, KeyError, struct.error) as e:
+            except (OSError, ValueError, KeyError, struct.error):
                 traceback.print_exc()
         elif 'XMP:GPSAltitude' in md:
             try:
                 alt = float(md['XMP:GPSAltitude'])
-            except (OSError, ValueError, KeyError, struct.error) as e:
+            except (OSError, ValueError, KeyError, struct.error):
                 traceback.print_exc()
         elif 'QuickTime:GPSAltitude' in md:
             try:
                 alt = float(md['QuickTime:GPSAltitude'])
-            except (OSError, ValueError, KeyError, struct.error) as e:
+            except (OSError, ValueError, KeyError, struct.error):
                 traceback.print_exc()
 
         return lat, lon, alt, video_time
-    except (OSError, ValueError, KeyError, struct.error) as e:
+    except (OSError, ValueError, KeyError, struct.error):
         traceback.print_exc()
         return None, None, None, None

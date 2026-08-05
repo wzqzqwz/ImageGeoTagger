@@ -1,7 +1,6 @@
 """编辑对话框集合"""
 
 import os
-import platform
 import threading
 import traceback
 import webbrowser
@@ -56,7 +55,7 @@ from models.media_file import FileStatus, get_val
 from services.date_processor import (
     update_file_shooting_date, clear_file_shooting_date
 )
-from utils.platform_utils import open_file_with_system
+from utils.platform_utils import _thread_is_alive
 from services.geo_processor import (
     find_files_with_same_location
 )
@@ -132,7 +131,9 @@ def _parse_coordinates(content):
         best_len = 0
         for lat_str, lat_val in lat_candidates:
             for lon_str, lon_val in lon_candidates:
-                if lat_str is lon_str:
+                # 同一数字文本既符合纬度又符合经度时视为同一次出现，
+                # 不能用 is 身份比较（依赖 CPython 字符串驻留，不可靠）
+                if lat_str == lon_str:
                     continue
                 pair_len = len(lat_str) + len(lon_str)
                 if pair_len > best_len:
@@ -171,11 +172,6 @@ class EditCoordinatesDialog:
         app.edit_windows.append(self.window)
 
         def on_close():
-            if hasattr(self, '_timer'):
-                try:
-                    self.window.after_cancel(self._timer)
-                except Exception:
-                    traceback.print_exc()
             if self.window in app.edit_windows:
                 app.edit_windows.remove(self.window)
             self.window.destroy()
@@ -345,7 +341,6 @@ class EditCoordinatesDialog:
             if result:
                 lat_str, lon_str, alt_str = result
                 lat, lon = float(lat_str), float(lon_str)
-                alt = float(alt_str) if alt_str else None
                 ic = self.app.location_clipboard
                 if (ic['latitude'] is not None
                         and abs(ic['latitude'] - lat) < 1e-6
@@ -374,6 +369,44 @@ class EditCoordinatesDialog:
             return
 
         self.clip_status_var.set("")
+
+    def _async_apply_to_file(self, write_job, on_success):
+        """后台线程执行磁盘写入，成功后回到主线程执行 on_success
+
+        写盘走 ExifTool/子进程可能耗时数秒，不能在主线程同步执行，
+        否则编辑对话框 UI 会冻结。
+        """
+        def _worker():
+            try:
+                write_job()
+            except Exception as e:
+                traceback.print_exc()
+                self.app.post_to_ui(lambda err=str(e): self._show_apply_error(err))
+                return
+            self.app.post_to_ui(on_success)
+
+        t = threading.Thread(target=_worker, daemon=True)
+        self.app.register_thread(t)
+        t.start()
+
+    def _dialog_alive(self):
+        """对话框仍存在则返回 True（写盘期间用户可能已按 Esc/关闭）"""
+        try:
+            return bool(self.window.winfo_exists())
+        except Exception:
+            return False
+
+    def _show_apply_error(self, err):
+        # 写盘失败时若用户已关闭对话框，不再弹错误框（避免在已销毁
+        # parent 上弹窗或误报），仅释放互斥锁
+        if not self._dialog_alive():
+            self._release_if_acquired()
+            return
+        try:
+            messagebox.showerror(_("错误"), _("操作失败") + ": " + err, parent=self.window)
+        except Exception:
+            traceback.print_exc()
+        self._release_if_acquired()
 
     def _save(self):
         # 全局互斥：防止与后台 geo 处理并发写同一文件
@@ -450,28 +483,36 @@ class EditCoordinatesDialog:
                             return
                         needs_batch = (result[0] == 2)
 
-            if lat_val is None and lon_val is None:
-                remove_gps_info(self.file_info.path)
-            else:
-                loc_info = {'latitude': lat_val, 'longitude': lon_val, 'altitude': alt_val}
-                ext = os.path.splitext(self.file_info.path)[1].lower()
-                if ext in RAW_EXTENSIONS:
-                    update_raw_gps(self.file_info.path, loc_info)
-                elif ext in VIDEO_EXTENSIONS:
-                    update_video_gps(self.file_info.path, loc_info)
-                elif ext in AUDIO_EXTENSIONS:
-                    update_audio_gps(self.file_info.path, loc_info)
+            def _finish_apply():
+                try:
+                    self.file_info.latitude = lat_val
+                    self.file_info.longitude = lon_val
+                    self.file_info.altitude = alt_val
+
+                    if needs_batch and same_loc_files:
+                        self._start_same_location_batch(lat_val, lon_val, alt_val, same_loc_files)
+                        return
+                    self._finalize_save()
+                except Exception:
+                    traceback.print_exc()
+                    self._release_if_acquired()
+
+            def _write_job():
+                if lat_val is None and lon_val is None:
+                    remove_gps_info(self.file_info.path)
                 else:
-                    update_image_gps(self.file_info.path, loc_info)
+                    loc_info = {'latitude': lat_val, 'longitude': lon_val, 'altitude': alt_val}
+                    ext = os.path.splitext(self.file_info.path)[1].lower()
+                    if ext in RAW_EXTENSIONS:
+                        update_raw_gps(self.file_info.path, loc_info)
+                    elif ext in VIDEO_EXTENSIONS:
+                        update_video_gps(self.file_info.path, loc_info)
+                    elif ext in AUDIO_EXTENSIONS:
+                        update_audio_gps(self.file_info.path, loc_info)
+                    else:
+                        update_image_gps(self.file_info.path, loc_info)
 
-            self.file_info.latitude = lat_val
-            self.file_info.longitude = lon_val
-            self.file_info.altitude = alt_val
-
-            if needs_batch and same_loc_files:
-                self._start_same_location_batch(lat_val, lon_val, alt_val, same_loc_files)
-                return
-            self._finalize_save()
+            self._async_apply_to_file(_write_job, _finish_apply)
 
         except ValueError:
             try:
@@ -622,10 +663,12 @@ class EditCoordinatesDialog:
 
         except Exception:
             traceback.print_exc()
-            try:
-                messagebox.showerror(_("错误"), _("操作失败"), parent=self.window)
-            except Exception:
-                traceback.print_exc()
+            # 窗口可能已被用户关闭：此时写盘已成功，不再误报"操作失败"
+            if self._dialog_alive():
+                try:
+                    messagebox.showerror(_("错误"), _("操作失败"), parent=self.window)
+                except Exception:
+                    traceback.print_exc()
         finally:
             self._release_if_acquired()
 
@@ -638,44 +681,46 @@ class EditCoordinatesDialog:
                 messagebox.showwarning(_("警告"), _("其他任务正在处理中，请等待完成"), parent=self.window)
                 return
             self._processing_acquired = True
-            try:
-                remove_gps_info(self.file_info.path)
-                self.file_info.latitude = None
-                self.file_info.longitude = None
-                self.file_info.altitude = None
 
-                with self.app.lock:
-                    if self.file_info in self.app.a:
-                        self.app.a.remove(self.file_info)
-                        self.app.b.append(self.file_info)
-
+            def _finish_clear():
                 try:
-                    self.tree.delete(self.item_id)
-                except Exception:
-                    traceback.print_exc()
+                    self.file_info.latitude = None
+                    self.file_info.longitude = None
+                    self.file_info.altitude = None
 
-                if self.results_window:
+                    with self.app.lock:
+                        if self.file_info in self.app.a:
+                            self.app.a.remove(self.file_info)
+                            self.app.b.append(self.file_info)
+
                     try:
-                        self.results_window.refresh()
+                        self.tree.delete(self.item_id)
                     except Exception:
                         traceback.print_exc()
 
-                try:
-                    messagebox.showinfo(_("成功"), _("GPS信息已清空"), parent=self.window)
-                except Exception:
+                    if self.results_window:
+                        try:
+                            self.results_window.refresh()
+                        except Exception:
+                            traceback.print_exc()
+
                     try:
-                        messagebox.showinfo(_("成功"), _("GPS信息已清空"))
+                        messagebox.showinfo(_("成功"), _("GPS信息已清空"), parent=self.window)
                     except Exception:
                         traceback.print_exc()
-                self._on_close()
-            except Exception:
-                traceback.print_exc()
-                try:
-                    messagebox.showerror(_("错误"), _("操作失败"), parent=self.window)
+                    self._on_close()
                 except Exception:
                     traceback.print_exc()
-            finally:
-                self._release_if_acquired()
+                    if self._dialog_alive():
+                        try:
+                            messagebox.showerror(_("错误"), _("操作失败"), parent=self.window)
+                        except Exception:
+                            traceback.print_exc()
+                finally:
+                    self._release_if_acquired()
+
+            self._async_apply_to_file(
+                lambda: remove_gps_info(self.file_info.path), _finish_clear)
 
     def _map_selector(self):
         _open_map_selector_async(self.app, self._open_selected_map)
@@ -811,6 +856,49 @@ class EditShootingDateDialog:
     def _paste_date(self):
         _paste_date_to_entries(self.window, self.date_entry, self.time_entry)
 
+    def _async_apply_to_file(self, write_job, on_success):
+        """后台线程执行磁盘写入，成功后回到主线程执行 on_success
+
+        写盘走 ExifTool/子进程可能耗时数秒，不能在主线程同步执行，
+        否则编辑对话框 UI 会冻结。
+        """
+        def _worker():
+            try:
+                write_job()
+            except Exception as e:
+                traceback.print_exc()
+                self.app.post_to_ui(lambda err=str(e): self._show_apply_error(err))
+                return
+            self.app.post_to_ui(on_success)
+
+        t = threading.Thread(target=_worker, daemon=True)
+        self.app.register_thread(t)
+        t.start()
+
+    def _dialog_alive(self):
+        """对话框仍存在则返回 True（写盘期间用户可能已按 Esc/关闭）"""
+        try:
+            return bool(self.window.winfo_exists())
+        except Exception:
+            return False
+
+    def _show_apply_error(self, err):
+        # 写盘失败时若用户已关闭对话框，不再弹错误框（避免在已销毁
+        # parent 上弹窗或误报），仅释放互斥锁
+        if not self._dialog_alive():
+            self._release_if_acquired()
+            return
+        try:
+            messagebox.showerror(_("错误"), _("操作失败") + ": " + err, parent=self.window)
+        except Exception:
+            traceback.print_exc()
+        self._release_if_acquired()
+
+    def _release_if_acquired(self):
+        if getattr(self, '_processing_acquired', False):
+            self.app.release_processing()
+            self._processing_acquired = False
+
     def _save(self):
         # 全局互斥：防止与后台 geo 处理并发写同一文件
         if not self.app.acquire_processing():
@@ -826,107 +914,117 @@ class EditShootingDateDialog:
                     new_dt = datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M:%S")
                 except ValueError:
                     messagebox.showerror(_("错误"), _("日期时间格式不正确"), parent=self.window)
+                    self._release_if_acquired()
                     return
             elif date_str or time_str:
                 messagebox.showerror(_("错误"), _("请同时填写日期和时间，或都留空"), parent=self.window)
+                self._release_if_acquired()
                 return
             else:
                 new_dt = None
+        except Exception:
+            traceback.print_exc()
+            self._release_if_acquired()
+            return
 
+        def _write_job():
             if new_dt is not None:
                 update_file_shooting_date(self.file_path, new_dt, self.file_ext)
             else:
                 clear_file_shooting_date(self.file_path, self.file_ext)
 
-            if isinstance(self.file_info, dict):
-                if new_dt is not None:
-                    self.file_info['original_date'] = new_dt.strftime('%Y-%m-%d %H:%M:%S')
+        def _finish_apply():
+            try:
+                if isinstance(self.file_info, dict):
+                    if new_dt is not None:
+                        self.file_info['original_date'] = new_dt.strftime('%Y-%m-%d %H:%M:%S')
+                    else:
+                        # 存 None 而非翻译串，避免排序/过滤/导出/切换语言后行为漂移
+                        self.file_info['original_date'] = None
+                    self.file_info['manual_edit_date'] = True
+                    self.file_info['status'] = FileStatus.MANUALLY_EDITED
                 else:
-                    # 存 None 而非翻译串，避免排序/过滤/导出/切换语言后行为漂移
-                    self.file_info['original_date'] = None
-                self.file_info['manual_edit_date'] = True
-                self.file_info['status'] = FileStatus.MANUALLY_EDITED
-            else:
-                self.file_info.dt = new_dt
-                self.file_info.manual_edit_date = True
+                    self.file_info.dt = new_dt
+                    self.file_info.manual_edit_date = True
 
-            if self.tree:
-                if self.is_date_tab:
-                    try:
-                        values = list(self.tree.item(self.item_id, 'values'))
-                        if len(values) >= 5:
-                            values[2] = self._get_info('original_date', _('无'))
-                            if (hasattr(self.results_window, 'operation_mode')
-                                    and self.results_window.operation_mode.get() == "rename_file"
-                                    and len(values) >= 6):
-                                fp = self.file_path
-                                if fp and new_dt:
-                                    existing = new_dt
-                                    new_fn = self.results_window._gen_new_name(
-                                        fp, existing, self.file_info)
-                                    if new_fn is None:
-                                        if self.file_info.get('manual_rename'):
-                                            new_fn = _('已手动重命名')
-                                        else:
-                                            new_fn = _('与原文件名相同')
-                                    elif not new_fn:
+                if self.tree:
+                    if self.is_date_tab:
+                        try:
+                            values = list(self.tree.item(self.item_id, 'values'))
+                            if len(values) >= 5:
+                                values[2] = self._get_info('original_date', '') or _('无')
+                                if (hasattr(self.results_window, 'operation_mode')
+                                        and self.results_window.operation_mode.get() == "rename_file"
+                                        and len(values) >= 6):
+                                    fp = self.file_path
+                                    if fp and new_dt:
+                                        existing = new_dt
+                                        new_fn = self.results_window._gen_new_name(
+                                            fp, existing, self.file_info)
+                                        if new_fn is None:
+                                            if self.file_info.get('manual_rename'):
+                                                new_fn = _('已手动重命名')
+                                            else:
+                                                new_fn = _('与原文件名相同')
+                                        elif not new_fn:
+                                            new_fn = _('无拍摄日期')
+                                    else:
                                         new_fn = _('无拍摄日期')
-                                else:
-                                    new_fn = _('无拍摄日期')
-                                values[4] = new_fn
-                                self.file_info['_new_filename_display'] = new_fn
-                            self.tree.item(self.item_id, values=values)
-                    except Exception:
-                        traceback.print_exc()
-                if hasattr(self.tree, 'sync_search'):
+                                    values[4] = new_fn
+                                    self.file_info['_new_filename_display'] = new_fn
+                                self.tree.item(self.item_id, values=values)
+                        except Exception:
+                            traceback.print_exc()
+                    if hasattr(self.tree, 'sync_search'):
+                        try:
+                            self.tree.sync_search()
+                        except Exception:
+                            traceback.print_exc()
+
+                if self.results_window and hasattr(self.results_window, 'refresh'):
                     try:
-                        self.tree.sync_search()
+                        self.results_window.refresh()
                     except Exception:
                         traceback.print_exc()
 
-            if self.results_window and hasattr(self.results_window, 'refresh'):
                 try:
-                    self.results_window.refresh()
+                    log_date = new_dt.strftime('%Y-%m-%d %H:%M:%S') if new_dt else _('无（已清除）')
+                    log_msg = _("编辑拍摄日期: ") + os.path.basename(self.file_path) + " → " + log_date + "\n"
+                    if hasattr(self.results_window, '_append_log'):
+                        try:
+                            self.results_window._append_log(log_msg)
+                        except Exception:
+                            traceback.print_exc()
                 except Exception:
                     traceback.print_exc()
-
-            try:
-                log_date = new_dt.strftime('%Y-%m-%d %H:%M:%S') if new_dt else _('无（已清除）')
-                log_msg = _("编辑拍摄日期: ") + os.path.basename(self.file_path) + " → " + log_date + "\n"
-                if hasattr(self.results_window, '_append_log'):
+                try:
+                    if self.results_window and hasattr(self.results_window, '_pulse_progress'):
+                        self.results_window._pulse_progress()
+                    elif self.results_window and hasattr(self.results_window, 'progress_bar'):
+                        rw = self.results_window
+                        rw.progress_label.config(text="")
+                        rw.progress_bar['value'] = 25
+                        rw.window.after(50, lambda: rw.progress_bar.config(value=50))
+                        rw.window.after(100, lambda: rw.progress_bar.config(value=75))
+                        rw.window.after(150, lambda: (rw.progress_bar.config(value=100),
+                                                       rw.progress_label.config(text=_("拍摄日期已更新"))))
+                except Exception:
+                    traceback.print_exc()
+                try:
+                    self.window.destroy()
+                except Exception:
+                    traceback.print_exc()
+            except Exception:
+                traceback.print_exc()
+                if self._dialog_alive():
                     try:
-                        self.results_window._append_log(log_msg)
+                        messagebox.showerror(_("错误"), _("操作失败"), parent=self.window)
                     except Exception:
                         traceback.print_exc()
-            except Exception:
-                traceback.print_exc()
-            try:
-                if self.results_window and hasattr(self.results_window, '_pulse_progress'):
-                    self.results_window._pulse_progress()
-                elif self.results_window and hasattr(self.results_window, 'progress_bar'):
-                    rw = self.results_window
-                    rw.progress_label.config(text="")
-                    rw.progress_bar['value'] = 25
-                    rw.window.after(50, lambda: rw.progress_bar.config(value=50))
-                    rw.window.after(100, lambda: rw.progress_bar.config(value=75))
-                    rw.window.after(150, lambda: (rw.progress_bar.config(value=100),
-                                                   rw.progress_label.config(text=_("拍摄日期已更新"))))
-            except Exception:
-                traceback.print_exc()
-            try:
-                self.window.destroy()
-            except Exception:
-                traceback.print_exc()
-        except Exception:
-            traceback.print_exc()
-            try:
-                messagebox.showerror(_("错误"), _("操作失败"), parent=self.window)
-            except Exception:
-                traceback.print_exc()
-        finally:
-            if getattr(self, '_processing_acquired', False):
-                self.app.release_processing()
-                self._processing_acquired = False
+            finally:
+                self._release_if_acquired()
+
+        self._async_apply_to_file(_write_job, _finish_apply)
 
 
 class BatchDateEditDialog:
@@ -1058,38 +1156,41 @@ class BatchDateEditDialog:
                     fp = get_val(fi, 'path', '')
                     ext = os.path.splitext(str(fp))[1].lower()
                     update_file_shooting_date(str(fp), new_dt, ext)
-                    if isinstance(fi, dict):
-                        fi['original_date'] = new_dt.strftime('%Y-%m-%d %H:%M:%S')
-                        fi['manual_edit_date'] = True
-                        fi['status'] = FileStatus.DATE_CHANGED
-                    else:
-                        # 同步更新内存中的日期，避免界面显示旧日期造成"没改成功"错觉
-                        fi.dt = new_dt
-                        fi.manual_edit_date = True
-                    return True, None
+                    # 工作线程只写磁盘；内存对象（original_date/status 等）
+                    # 由主线程 poll 收尾时在互斥锁内统一回填，避免无锁并发写
+                    return True, None, fi
                 except Exception as e:
-                    return False, str(e)
+                    return False, str(e), None
 
             prog_total = len(self.selected_files)
             prog_done = [0]
             prog_success = [0]
             prog_failed = [0]
+            prog_moved = []
             prog_lock = threading.Lock()
+            prog_move_lock = threading.Lock()
 
             def process():
                 try:
                     with ThreadPoolExecutor(max_workers=min(8, (os.cpu_count() or 4) * 2)) as pool:
                         futs = {pool.submit(process_one, fi): fi for fi in self.selected_files}
                         for fut in as_completed(futs):
-                            ok, _ = fut.result()
+                            ok, _, fi = fut.result()
                             with prog_lock:
                                 if ok:
                                     prog_success[0] += 1
+                                    with prog_move_lock:
+                                        prog_moved.append(fi)
                                 else:
                                     prog_failed[0] += 1
                                 prog_done[0] += 1
                 except Exception:
                     traceback.print_exc()
+                finally:
+                    # 主窗口已销毁导致 poll 停止轮询时，在此兜底释放互斥锁，
+                    # 避免全局锁被永久占用
+                    if not self._root_alive():
+                        self._release_if_acquired()
 
             prog_thread = threading.Thread(target=process, daemon=True)
             self.app.register_thread(prog_thread)
@@ -1097,12 +1198,16 @@ class BatchDateEditDialog:
 
             def poll():
                 try:
-                    alive = prog_thread.is_alive()
+                    alive = _thread_is_alive(prog_thread)
                     with prog_lock:
                         d = prog_done[0]
                         s = prog_success[0]
                         f = prog_failed[0]
                     if not alive:
+                        with prog_move_lock:
+                            moved = list(prog_moved)
+                            prog_moved.clear()
+                        self._apply_moves(moved, new_dt)
                         self._finish_up(s, f)
                         return
                     if prog_total > 0:
@@ -1118,13 +1223,18 @@ class BatchDateEditDialog:
                                     rw.window.update_idletasks()
                             except Exception:
                                 pass
+                    if not self._root_alive():
+                        # 主窗口已销毁：停止轮询，互斥锁由 process 线程 finally 兜底释放
+                        return
                     self.app.root.after(200, poll)
                 except Exception:
                     traceback.print_exc()
-                    try:
-                        self.app.root.after(200, poll)
-                    except Exception:
-                        traceback.print_exc()
+                    if self._root_alive():
+                        try:
+                            self.app.root.after(200, poll)
+                        except Exception:
+                            traceback.print_exc()
+                    # 主窗口已销毁：停止轮询（process 线程 finally 会释放锁）
 
             prog_thread.start()
             poll()
@@ -1170,6 +1280,39 @@ class BatchDateEditDialog:
             except Exception:
                 traceback.print_exc()
         self._release_if_acquired()
+
+    def _root_alive(self):
+        try:
+            return bool(self.app.root.winfo_exists())
+        except Exception:
+            return False
+
+    def _apply_moves(self, moved_files, new_dt):
+        """主线程加锁回填批量日期写入结果到内存对象
+
+        worker 线程只写磁盘，此方法在互斥锁内更新 original_date/dt 等属性，
+        避免与主线程 UI 回调无锁并发造成撕裂读/覆盖。
+        """
+        if not moved_files:
+            return
+        dt_str = new_dt.strftime('%Y-%m-%d %H:%M:%S')
+        with self.app.lock:
+            for fi in moved_files:
+                try:
+                    if isinstance(fi, dict):
+                        fi['original_date'] = dt_str
+                        fi['manual_edit_date'] = True
+                        fi['status'] = FileStatus.DATE_CHANGED
+                    else:
+                        fi.dt = new_dt
+                        fi.manual_edit_date = True
+                except Exception:
+                    traceback.print_exc()
+        if self.tree:
+            try:
+                self.tree.sync_search()
+            except Exception:
+                traceback.print_exc()
 class BatchLocationEditDialog:
     """批量编辑位置信息对话框"""
 
@@ -1256,6 +1399,12 @@ class BatchLocationEditDialog:
         if getattr(self, '_processing_acquired', False):
             self.app.release_processing()
             self._processing_acquired = False
+
+    def _root_alive(self):
+        try:
+            return bool(self.app.root.winfo_exists())
+        except Exception:
+            return False
 
     def _parse_coordinates(self, content):
         return _parse_coordinates(content)
@@ -1376,29 +1525,38 @@ class BatchLocationEditDialog:
             failed = 0
             moves = []
             _lock = threading.Lock()
-            self.app.post_to_ui(lambda: self._update_results_progress(0, _("处理中...")))
-            with ThreadPoolExecutor(max_workers=min(8, (os.cpu_count() or 4) * 2)) as pool:
-                futs = {pool.submit(process_one, fi): fi for fi in self.selected_files}
-                done = 0
-                for fut in as_completed(futs):
-                    ok, move_info = fut.result()
-                    if ok:
+            try:
+                self.app.post_to_ui(lambda: self._update_results_progress(0, _("处理中...")))
+                with ThreadPoolExecutor(max_workers=min(8, (os.cpu_count() or 4) * 2)) as pool:
+                    futs = {pool.submit(process_one, fi): fi for fi in self.selected_files}
+                    done = 0
+                    for fut in as_completed(futs):
+                        ok, move_info = fut.result()
+                        if ok:
+                            with _lock:
+                                success += 1
+                                if move_info:
+                                    moves.append(move_info)
+                        else:
+                            with _lock:
+                                failed += 1
                         with _lock:
-                            success += 1
-                            if move_info:
-                                moves.append(move_info)
-                    else:
-                        with _lock:
-                            failed += 1
-                    with _lock:
-                        done += 1
-                    if done % 5 == 0 or done == total:
-                        self.app.post_to_ui(lambda d=done, t=total: (
-                            self._update_results_progress(d / t * 100,
-                                                          _("进度: ") + str(d) + "/" + str(total))
-                        ))
-            self.app.post_to_ui(lambda s=success, f=failed, mv=moves:
-                                self._on_loc_batch_done(s, f, mv))
+                            done += 1
+                        if done % 5 == 0 or done == total:
+                            self.app.post_to_ui(lambda d=done, t=total: (
+                                self._update_results_progress(d / t * 100,
+                                                              _("进度: ") + str(d) + "/" + str(total))
+                            ))
+                self.app.post_to_ui(lambda s=success, f=failed, mv=moves:
+                                    self._on_loc_batch_done(s, f, mv))
+            except Exception:
+                traceback.print_exc()
+                # 异常时不再走 _on_loc_batch_done（moves 可能不完整），只释放锁
+                self.app.post_to_ui(self._release_if_acquired)
+            finally:
+                # 主窗口已销毁导致 post_to_ui 回调不再执行时，兜底释放互斥锁
+                if not self._root_alive():
+                    self._release_if_acquired()
 
         t = threading.Thread(target=process, daemon=True)
         self.app.register_thread(t)
@@ -1428,6 +1586,9 @@ class BatchLocationEditDialog:
                                 self.app.b.append(fi)
                     except Exception:
                         traceback.print_exc()
+        # 先释放全局互斥锁：show_results 内部会重建结果窗口并可能触发
+        # 新的后台任务（需要 acquire_processing），持锁调用会互相等待卡死
+        self._release_if_acquired()
         try:
             self.app.geo_tab.show_results()
         except Exception:
@@ -1438,7 +1599,6 @@ class BatchLocationEditDialog:
                 rw.progress_label.config(text=_("完成: ") + str(success) + _("成功/") + str(failed) + _("失败"))
         except Exception:
             traceback.print_exc()
-        self._release_if_acquired()
 
 
 class GpxPointDetails:

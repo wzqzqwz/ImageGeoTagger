@@ -9,7 +9,7 @@
 import os
 import traceback
 import xml.etree.ElementTree as ET
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 
 try:
     from defusedxml import ElementTree as SafeET
@@ -64,6 +64,12 @@ def _reject_unsafe_xml(gpx_file_path):
                         buf += chunk
                         continue
                     pos = end + 3
+                    # 截断已消费的前导：buf 无界增长会使单段注释多时
+                    # 出现 O(n²) 复制（实测 180MB 前导耗时 49s），
+                    # 且内存随文件大小线性膨胀
+                    if pos > 1024 * 1024:
+                        buf = buf[pos:]
+                        pos = 0
                     continue
                 if buf.startswith(b'<?', lt):
                     # 处理指令（如 XML 声明）：跳过
@@ -77,6 +83,9 @@ def _reject_unsafe_xml(gpx_file_path):
                         buf += chunk
                         continue
                     pos = end + 2
+                    if pos > 1024 * 1024:
+                        buf = buf[pos:]
+                        pos = 0
                     continue
                 if len(buf) - lt < 9:
                     # 声明/标签可能被截断在缓冲区边界，补齐后再判断

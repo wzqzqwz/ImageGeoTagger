@@ -14,7 +14,7 @@
 import os
 import threading
 import traceback
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from config import RAW_EXTENSIONS, VIDEO_EXTENSIONS, AUDIO_EXTENSIONS
@@ -156,7 +156,6 @@ def process_location_info(a_list, b_list, gps_data, threshold_minutes=30,
                     try:
                         wfut.result()
                         write_done += 1
-                        updated_count += 1
                         moved_files.append((f, loc))
                         succeeded = True
                     except Exception as write_err:
@@ -190,9 +189,12 @@ def process_location_info(a_list, b_list, gps_data, threshold_minutes=30,
                             rset = {id(f) for f, _ in to_move}
                             b_list[:] = [x for x in b_list if id(x) not in rset]
                             a_list.extend(f for f, _ in to_move)
-                        # 写盘成功后才把坐标写入对象（锁内一次性完成），
+                            # 只在文件确实移入 a_list 时计数，与 UI 列表状态一致，
+                            # 避免处理期间被编辑对话框移出列表的文件造成统计虚高
+                            updated_count += len(to_move)
+                        # 写盘成功即回填坐标（含处理期间被移出 b_list 的文件），
                         # 保证对象与磁盘实际状态一致且主线程渲染无撕裂读
-                        for f, loc in to_move:
+                        for f, loc in moved_files:
                             f.latitude = loc['latitude']
                             f.longitude = loc['longitude']
                             f.altitude = loc['altitude']

@@ -7,10 +7,8 @@
   - 获取文件的最佳可用日期时间（多来源优先级）
 """
 
-import os
 import platform
 import re
-import traceback
 from datetime import datetime
 from pathlib import Path
 
@@ -112,8 +110,7 @@ def get_file_creation_datetime(file_path):
         if platform.system() == 'Windows':
             return datetime.fromtimestamp(stat_result.st_ctime)
     except (OSError, AttributeError, OverflowError, ValueError):
-        traceback.print_exc()
-    return None
+        return None
 
 
 def get_existing_datetime(file_path, fallback_to_fs=True):

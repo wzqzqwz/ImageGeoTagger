@@ -4,8 +4,6 @@
 以及在地理位置处理过程中作为参考点。
 """
 
-from datetime import datetime
-
 
 class GpsPoint:
     """GPS 轨迹点数据模型

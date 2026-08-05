@@ -14,12 +14,8 @@ from services.export_service import (
     export_to_txt, export_to_csv, export_to_json, export_to_gpx,
     generate_statistics,
 )
-from ui.dialogs import (
-    EditCoordinatesDialog, GpxPointDetails,
-    BatchDateEditDialog, BatchLocationEditDialog
-)
 from utils.i18n import _
-from config import ALL_MEDIA_EXTENSIONS
+from utils.platform_utils import _thread_is_alive
 try:
     from tkinterdnd2 import DND_FILES
 except ImportError:
@@ -236,18 +232,8 @@ class GeoTab:
     def is_thread_running(self):
         with self.app.lock:
             return (self.app.current_thread is not None and
-                    self.app.current_thread.is_alive() and
+                    _thread_is_alive(self.app.current_thread) and
                     self.app.is_processing)
-
-    def ensure_exiftool_available(self):
-        from utils.exif_utils import check_exiftool
-        available, _ = check_exiftool()
-        if not available:
-            messagebox.showwarning(_("ExifTool未安装"),
-                                    _("ExifTool未安装或不在系统路径中\n\n某些功能可能受限（如RAW/视频文件处理）\n\n是否打开ExifTool官方网站下载？"),
-                                    parent=self.app.root)
-            return False
-        return True
 
     def start_extract_thread(self):
         if self.is_thread_running():

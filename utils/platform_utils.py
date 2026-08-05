@@ -12,6 +12,14 @@ import subprocess
 from utils.i18n import _
 
 
+def _thread_is_alive(t):
+    """线程是否存活（未启动或已停止均视为不存活，避免 is_alive 抛 RuntimeError"""
+    try:
+        return t.is_alive()
+    except (RuntimeError, AttributeError):
+        return False
+
+
 def get_app_dir():
     """获取应用程序目录（兼容 PyInstaller 打包模式）
 

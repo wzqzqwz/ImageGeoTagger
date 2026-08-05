@@ -53,7 +53,7 @@ def main():
         except Exception:
             traceback.print_exc()
 
-        app = MainWindow(root)
+        MainWindow(root)
 
         root.mainloop()
 

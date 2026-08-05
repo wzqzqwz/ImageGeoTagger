@@ -37,15 +37,29 @@ def _no_clobber_rename(src, dst):
     """原子重命名且不覆盖已存在目标（跨平台）
 
     Windows 的 os.rename 目标存在时抛 FileExistsError；
-    macOS/Linux 的 os.rename 会静默覆盖目标，因此改用
+    macOS/Linux 的 os.rename 会静默覆盖目标，因此优先用
     os.link（目标已存在时抛 FileExistsError，POSIX 原子）+ os.unlink。
-    跨分区时 os.link 抛 OSError(EXDEV)，交由调用方按失败处理。
+    文件系统不支持硬链接（FAT32/exFAT/网络挂载/EPERM 等）时，
+    回退为"预检目标不存在 + os.rename"（存在极窄 TOCTOU 窗口，
+    与 Windows 主路径语义一致，可接受）。
+    跨分区时 os.link 抛 OSError(EXDEV)，由调用方按失败处理。
     """
     if os.name == 'nt':
         os.rename(src, dst)
     else:
-        os.link(src, dst)
-        os.unlink(src)
+        try:
+            os.link(src, dst)
+            os.unlink(src)
+        except FileExistsError:
+            raise
+        except OSError:
+            # os.unlink 已成功但 os.link 抛错（基本不会出现）时，
+            # 源已消失表示重命名已完成，不再重复回退
+            if not os.path.exists(src):
+                return
+            if os.path.exists(dst):
+                raise FileExistsError(f"Destination exists: {dst}")
+            os.rename(src, dst)
 
 
 # Fixed column identifiers (not translated - used as internal Treeview column IDs)
@@ -349,6 +363,12 @@ class DateTab:
         for fi in self.files_to_process:
             if not isinstance(fi, dict):
                 continue
+            # 手动重命名/手动编辑过的文件保持原状态：
+            # 重置会丢失 MANUALLY_RENAMED 标记，之后被当成普通待处理文件
+            # 反复包含进处理流程，并可能在批量重命名中误改名
+            if fi.get('manual_rename') or fi.get('manual_edit_date') or \
+                    fi.get('status') in (FileStatus.MANUALLY_RENAMED, FileStatus.MANUALLY_EDITED):
+                continue
             path = fi.get('path', '')
             if not path:
                 continue
@@ -515,7 +535,6 @@ class DateTab:
                 items_to_remove.append(values[6])
 
         # 路径映射查找，避免对每个选中行线性扫描 files_to_process（O(sel×n)）
-        path_to_f = {str(f.get('path', '')): f for f in self.files_to_process}
         remove_paths = set(items_to_remove)
         self.files_to_process[:] = [
             f for f in self.files_to_process if str(f.get('path', '')) not in remove_paths]
@@ -550,30 +569,38 @@ class DateTab:
         if not self.app.acquire_processing():
             messagebox.showwarning(_("警告"), _("其他任务正在处理中，请等待完成"), parent=self.app.root)
             return
-        try:
-            paths = []
-            for item_id in selected_items:
-                values = self.date_tree.item(item_id, 'values')
-                if values and len(values) >= 7:
-                    paths.append(values[6])
+        # 主线程解析路径（Tk 调用不能在 worker 线程执行）
+        paths = []
+        for item_id in selected_items:
+            values = self.date_tree.item(item_id, 'values')
+            if values and len(values) >= 7:
+                paths.append(values[6])
 
+        def worker():
             success, failed = send_to_recycle_bin(paths)
-            failed_paths = set(f[0] for f in failed) if failed else set()
+            self.app.post_to_ui(
+                lambda s=success, f=failed, p=paths: self._apply_delete_results(s, f, p))
 
+        thread = threading.Thread(target=worker, daemon=True)
+        self.app.register_thread(thread)
+        thread.start()
+
+    def _apply_delete_results(self, success, failed, paths):
+        try:
+            failed_paths = set(p for p, _ in failed) if failed else set()
             # O(n) 重建列表：避免对每个选中行线性扫描 files_to_process（O(sel×n)）
-            removed_paths = {tree_path for tree_path in paths if tree_path not in failed_paths}
+            removed_paths = set(paths) - failed_paths
             self.files_to_process[:] = [
                 f for f in self.files_to_process
                 if str(f.get('path', '')) not in removed_paths]
 
-            for item_id in selected_items:
+            for item_id in list(self.date_tree.get_children()):
                 values = self.date_tree.item(item_id, 'values')
-                if values and len(values) >= 7:
-                    if values[6] not in failed_paths:
-                        try:
-                            self.date_tree.delete(item_id)
-                        except Exception:
-                            traceback.print_exc()
+                if values and len(values) >= 7 and values[6] in removed_paths:
+                    try:
+                        self.date_tree.delete(item_id)
+                    except Exception:
+                        traceback.print_exc()
 
             self._update_preview()
             self.status_var.set(_("已将 ") + str(success) + _(" 个文件移至回收站"))
@@ -582,6 +609,8 @@ class DateTab:
                 for name, err in failed:
                     self._append_log(_("失败: ") + name + " - " + err + "\n")
             self._pulse_progress()
+        except Exception:
+            traceback.print_exc()
         finally:
             self.app.release_processing()
 
@@ -640,8 +669,8 @@ class DateTab:
         except FileExistsError:
             messagebox.showerror(_("错误"), _("目标文件已存在: ") + new_name)
             return
-        except OSError:
-            messagebox.showerror(_("错误"), _("重命名失败（可能跨分区），请使用复制后删除的方式"))
+        except OSError as e:
+            messagebox.showerror(_("错误"), _("重命名失败: ") + str(e))
             return
         file_info['path'] = new_path
         file_info['filename'] = new_name
@@ -667,7 +696,17 @@ class DateTab:
                 continue
             if fi.get('status') != FileStatus.PENDING_RENAME:
                 continue
-            new_fn = vals[4]
+            # 不能用树列显示文本当目标名：_gen_new_name 返回 None 时
+            # 该列显示的是本地化占位符（"已手动重命名"/"与原文件名相同"），
+            # 直接使用会把文件改成垃圾名。这里重新计算真实目标名。
+            existing = None
+            cached = fi.get('original_date')
+            if cached:
+                try:
+                    existing = datetime.strptime(cached, '%Y-%m-%d %H:%M:%S')
+                except (ValueError, TypeError):
+                    existing = None
+            new_fn = self._gen_new_name(file_path, existing, fi)
             if not new_fn:
                 continue
             to_rename.append((fi, file_path, new_fn))
@@ -711,12 +750,16 @@ class DateTab:
                     actual_new_fn = os.path.basename(target)
                     try:
                         _no_clobber_rename(fp, target)
+                        self.app.post_to_ui(lambda n=os.path.basename(fp), an=actual_new_fn: self._append_log(
+                            _("已重命名") + ": " + n + " → " + an + "\n"))
+                        # 磁盘操作完成后统一更新内存状态：若先把 status 置为
+                        # MANUALLY_RENAMED，post_to_ui 回调可能立即在主线程触发
+                        # _update_preview，读到"已标记但 path/filename 未更新"
+                        # 的中间态
                         fi['path'] = target
                         fi['filename'] = actual_new_fn
                         fi['status'] = FileStatus.MANUALLY_RENAMED
                         fi['manual_rename'] = True
-                        self.app.post_to_ui(lambda n=os.path.basename(fp), an=actual_new_fn: self._append_log(
-                            _("已重命名") + ": " + n + " → " + an + "\n"))
                         used_targets.add(target)
                         if actual_new_fn != new_fn:
                             self.app.post_to_ui(lambda an=actual_new_fn, o=new_fn: self._append_log(
@@ -783,7 +826,10 @@ class DateTab:
             # 第一阶段：先完整收集文件列表，确定总文件数，
             # 避免边遍历边处理时总数未定导致进度条来回跳动
             all_files = []
-            for r, _dirs, fs in os.walk(folder):
+            # onerror 跳过无法访问的目录，避免一个无权限子目录中断整个扫描
+            def _on_walk_error(exc):
+                pass
+            for r, _dirs, fs in os.walk(folder, onerror=_on_walk_error):
                 for f in fs:
                     ext = os.path.splitext(f)[1].lower()
                     if ext not in ALL_MEDIA_EXTENSIONS:
@@ -800,7 +846,7 @@ class DateTab:
                 def _process_batch():
                     nonlocal count
                     for fut in as_completed(pending):
-                        fp = pending.pop(fut)
+                        pending.pop(fut, None)
                         try:
                             results.append(fut.result())
                         except Exception:
@@ -876,9 +922,27 @@ class DateTab:
 
         # 本预览周期内复用候选目标名的存在性判断，避免主线程逐行重复 stat
         self._name_exists_cache = {}
-        sorted_files = sorted(
-            self.files_to_process,
-            key=lambda x: x.get('original_date', '') if x.get('original_date') is not None else '9999-12-31 23:59:59')
+        no_date = '9999-12-31 23:59:59'
+        sort_col = getattr(self, 'date_sort_column', None)
+        if sort_col == '文件名':
+            sorted_files = sorted(
+                self.files_to_process,
+                key=lambda x: str(x.get('filename', '')).lower(),
+                reverse=self.date_sort_reverse)
+        elif sort_col == '状态':
+            sorted_files = sorted(
+                self.files_to_process,
+                key=lambda x: status_sort_key(x.get('status')),
+                reverse=self.date_sort_reverse)
+        else:
+            # 默认按拍摄日期升序；用户点了表头排序后保持其列与方向，
+            # 不再被预览刷新无条件打回日期序
+            key = (lambda x: x.get('original_date') if x.get('original_date') is not None else no_date)
+            if sort_col == '文件拍摄日期':
+                sorted_files = sorted(self.files_to_process, key=key,
+                                      reverse=self.date_sort_reverse)
+            else:
+                sorted_files = sorted(self.files_to_process, key=key)
 
         rename_mode = self.operation_mode.get() == "rename_file"
         for i, fi in enumerate(sorted_files, start=1):
@@ -951,6 +1015,9 @@ class DateTab:
             return
         # 处理期间 worker 对磁盘进行重命名，此时重算预览既卡主线程又与 worker 快照不一致
         if getattr(self, '_processing', False):
+            return
+        # 扫描进行中 files_to_process 尚未就绪，跳过避免重复工作
+        if getattr(self, '_scanning', False) or not self.files_to_process:
             return
         # 本刷新周期内复用候选目标名的存在性判断
         self._name_exists_cache = {}
@@ -1152,15 +1219,17 @@ class DateTab:
             if _entry is not None:
                 self.app.post_to_ui(lambda e=_entry: e.config(state=state))
 
-    def _get_eligible_files(self, operation_mode):
+    def _get_eligible_files(self, operation_mode, dry_run):
         files_copy = list(self.files_to_process)
         to_process = []
         for fi in files_copy:
             st = fi.get('status')
             if st in (FileStatus.NO_DATE_NEEDED, FileStatus.NO_RENAME_NEEDED,
-                      FileStatus.SKIPPED, FileStatus.RENAMED, FileStatus.DATE_CHANGED,
-                      FileStatus.DRY_RUN, FileStatus.DRY_RUN_DATE_CHANGED):
+                      FileStatus.SKIPPED, FileStatus.RENAMED, FileStatus.DATE_CHANGED):
                 continue
+            # 试运行状态仅表示预览结果：再次试运行（如修改前缀/后缀后）
+            # 必须重新执行才能刷新预览，正式处理也须落地修改，
+            # 因此 DRY_RUN 文件一律重新纳入待处理列表
             if operation_mode == "change_date":
                 if fi.get('manual_edit_date'):
                     continue
@@ -1194,7 +1263,15 @@ class DateTab:
 
     def _process_single_file_rename(self, fi, dry_run, prefix_val, suffix_val):
         fp = fi['path']
-        existing = get_existing_datetime(fp)
+        # 复用扫描时缓存的 original_date（扫描已按 fallback_to_fs 解析过），
+        # 避免重命名模式对每个文件重复读盘解析 EXIF
+        existing = None
+        cached = fi.get('original_date')
+        if cached:
+            try:
+                existing = datetime.strptime(cached, '%Y-%m-%d %H:%M:%S')
+            except (ValueError, TypeError):
+                existing = None
         if existing and existing != datetime.min:
             new_name = self._gen_new_name(fp, existing, fi, prefix=prefix_val, suffix=suffix_val)
             if new_name is None:
@@ -1225,12 +1302,16 @@ class DateTab:
                             renamed_to = os.path.basename(target)
                             break
                         except FileExistsError:
+                            # 编号名穷尽（10000 个候选全被占用）视为目标已存在
                             if counter >= 10000:
                                 break
                             target = os.path.join(base_dir, f"{orig_stem}_{counter:03d}{ext}")
                             counter += 1
-                        except OSError:
-                            break
+                        except OSError as e:
+                            # 真实系统错误（权限/磁盘/跨分区等）：报出实际原因，
+                            # 不再误报为"目标文件已存在"
+                            fi['status_detail'] = _("重命名失败: ") + str(e)
+                            return
                     if renamed_to is None:
                         fi['status'] = FileStatus.FAILED
                         fi['status_detail'] = _("目标文件已存在: ") + new_name
@@ -1314,7 +1395,7 @@ class DateTab:
             self.app.post_to_ui(lambda: self.status_var.set(_("处理中...")))
             self._set_ui_processing_state(True)
 
-            files_copy, to_process = self._get_eligible_files(operation_mode)
+            files_copy, to_process = self._get_eligible_files(operation_mode, dry_run)
             total = len(files_copy)
 
             if not to_process:
@@ -1453,12 +1534,12 @@ class DateTab:
                 fp = fi.get('path', '')
                 ext = os.path.splitext(str(fp))[1].lower()
                 update_file_shooting_date(str(fp), new_dt, ext)
-                fi['original_date'] = new_dt.strftime('%Y-%m-%d %H:%M:%S')
-                fi['manual_edit_date'] = True
-                fi['status'] = FileStatus.DATE_CHANGED
-                return True, None, fi
+                # 工作线程只写磁盘；fi 内存状态（original_date/status 等）
+                # 由主线程 _apply_batch_date_moves 加锁统一回填，
+                # 避免处理中主线程 UI 回调读到中间态
+                return True, None, fi, new_dt
             except Exception as e:
-                return False, str(e), fi
+                return False, str(e), fi, None
 
         def process():
             try:
@@ -1482,13 +1563,16 @@ class DateTab:
                 failed = 0
                 errors = []
                 done = 0
+                moves = []
 
                 with ThreadPoolExecutor(max_workers=min(32, (os.cpu_count() or 4) * 2)) as pool:
                     futs = {pool.submit(process_one, fi): fi for fi in files_to_process}
                     for fut in as_completed(futs):
-                        ok, err, fi = fut.result()
+                        ok, err, fi, new_dt = fut.result()
                         if ok:
                             success += 1
+                            # 循环在 process 后台线程内单线程执行，收集无需加锁
+                            moves.append((fi, new_dt))
                         else:
                             failed += 1
                             if err:
@@ -1500,6 +1584,7 @@ class DateTab:
                                 self.status_var.set(_("进度: ") + str(d) + "/" + str(t))
                             ))
 
+                self.app.post_to_ui(lambda m=moves: self._apply_batch_date_moves(m))
                 self.app.post_to_ui(self._update_preview)
                 self.app.post_to_ui(lambda: (
                     self.log_text.config(state='normal'),
@@ -1529,6 +1614,19 @@ class DateTab:
         t = threading.Thread(target=process, daemon=True)
         self.app.register_thread(t)
         t.start()
+
+    def _apply_batch_date_moves(self, moves):
+        """主线程加锁回填批量改日期结果（worker 线程只写磁盘）"""
+        if not moves:
+            return
+        with self.app.lock:
+            for fi, new_dt in moves:
+                try:
+                    fi['original_date'] = new_dt.strftime('%Y-%m-%d %H:%M:%S')
+                    fi['manual_edit_date'] = True
+                    fi['status'] = FileStatus.DATE_CHANGED
+                except Exception:
+                    traceback.print_exc()
 
     def export_results(self):
         if getattr(self, '_processing', False):

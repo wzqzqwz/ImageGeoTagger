@@ -6,21 +6,13 @@ import queue
 import tkinter as tk
 from tkinter import ttk
 import threading
-import time
 import traceback
 
 from ui import custom_msgbox as messagebox
 from ui.geo_tab import GeoTab
 from ui.date_tab import DateTab
 from utils.i18n import _, get_language, load_lang, get_supported_languages, set_language
-
-
-def _thread_is_alive(t):
-    """线程是否存活（未启动或已停止均视为不存活，避免 is_alive 抛 RuntimeError"""
-    try:
-        return t.is_alive()
-    except (RuntimeError, AttributeError):
-        return False
+from utils.platform_utils import _thread_is_alive
 
 # 窗口配置写入用户主目录，避免打包版写入 _MEIPASS 临时目录导致永久失效
 CONFIG_DIR = os.path.join(os.path.expanduser('~'), '.imagegeotagger')
@@ -209,7 +201,7 @@ class MainWindow:
 
             # 等待后台任务完成，避免 daemon 线程被强杀导致 ExifTool 写入截断损坏文件
             with self.lock:
-                alive = [t for t in self.background_threads if t.is_alive()]
+                alive = [t for t in self.background_threads if _thread_is_alive(t)]
             if alive:
                 messagebox.showwarning(
                     _("警告"),
