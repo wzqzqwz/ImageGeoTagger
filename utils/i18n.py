@@ -3,6 +3,7 @@
 import json
 import locale
 import os
+import sys
 
 _TRANSLATIONS = {}
 _CURRENT_LANG = 'zh'
@@ -19,16 +20,32 @@ _SUPPORTED = {
 }
 
 def _detect_system_lang():
-    """检测系统语言，返回语言代码"""
+    """检测系统语言，返回语言代码
+
+    优先使用 locale 检测；Windows 上 locale 返回值是
+    'Chinese (Simplified)_China' 这类格式，无法直接匹配语言码，
+    改用 GetUserDefaultUILanguage 获取真实的系统 UI 语言。
+    """
     try:
         code = locale.getlocale()[0]
         if code:
-            code = code.split('_')[0]
+            code = code.split('_')[0].lower()
             if code in _SUPPORTED:
                 return code
     except Exception:
         pass
-    return 'zh'
+    if sys.platform == 'win32':
+        try:
+            import ctypes
+            lcid = ctypes.windll.kernel32.GetUserDefaultUILanguage()
+            name = locale.windows_locale.get(lcid)
+            if name:
+                code = name.split('_')[0]
+                if code in _SUPPORTED:
+                    return code
+        except Exception:
+            pass
+    return 'en'
 
 def load_lang(lang_code=None):
     """加载指定语言包，None 则自动检测"""

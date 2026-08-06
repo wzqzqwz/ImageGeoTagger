@@ -22,6 +22,7 @@ from utils.media_utils import get_file_creation_datetime
 from models.media_file import MediaFileInfo
 from models.gps_data import GpsPoint
 from utils.logging_utils import log_exc, log_warning
+from utils.i18n import _
 
 
 def _sort_key(x):
@@ -73,7 +74,7 @@ def scan_folder(folder_path, progress_callback=None, only_process_with_date=Fals
     try:
         if not os.path.isdir(folder_path):
             return [], [], [], 0, 0
-        for r, _, fs in os.walk(folder_path, onerror=_on_walk_error):
+        for r, _dirs, fs in os.walk(folder_path, onerror=_on_walk_error):
             for f in fs:
                 ext = os.path.splitext(f)[1].lower()
                 if ext == '.gpx':

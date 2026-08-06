@@ -139,7 +139,7 @@ class _StayOpenWorker:
             # {ready} 之前已把本命令的 stderr 全部写入管道，滞后只来自
             # 线程调度。短暂等待直到队列长度稳定，可保证错误文本归属
             # 正确，避免把上一条命令的 stderr 算到本条头上（假成功）。
-            for _ in range(50):
+            for _i in range(50):
                 cur = self._stderr_trimmed + len(self._stderr_lines)
                 time.sleep(0.005)
                 if cur == self._stderr_trimmed + len(self._stderr_lines):

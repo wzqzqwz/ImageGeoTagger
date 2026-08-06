@@ -17,7 +17,10 @@ import traceback
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from config import RAW_EXTENSIONS, VIDEO_EXTENSIONS, AUDIO_EXTENSIONS
+from config import (
+    RAW_EXTENSIONS, VIDEO_EXTENSIONS, AUDIO_EXTENSIONS,
+    DEFAULT_TIME_THRESHOLD_MINUTES, MAX_ITERATIONS,
+)
 from utils.exif_utils import (
     update_image_gps, update_raw_gps, update_video_gps, update_audio_gps
 )
@@ -51,10 +54,11 @@ def _to_utc_naive(dt):
     return dt
 
 
-def process_location_info(a_list, b_list, gps_data, threshold_minutes=30,
-                          max_iterations=10, progress_callback=None,
+def process_location_info(a_list, b_list, gps_data,
+                          threshold_minutes=DEFAULT_TIME_THRESHOLD_MINUTES,
+                          max_iterations=MAX_ITERATIONS, progress_callback=None,
                           iteration_callback=None, log_callback=None,
-                          lock=None, dry_run=False):
+                          lock=None):
     """处理无 GPS 文件的位置信息
 
     通过时间匹配算法，为没有 GPS 坐标的文件分配位置。
@@ -70,9 +74,6 @@ def process_location_info(a_list, b_list, gps_data, threshold_minutes=30,
         iteration_callback: 迭代回调函数(当前轮次, 总轮次)
         log_callback: 日志回调函数(消息字符串)
         lock: 并发访问 a_list/b_list 的互斥锁
-        dry_run: 试运行模式。为 True 时只匹配与记录"将写入"日志，
-                不写盘、不移动文件；返回值 updated_count 表示
-                "将更新的文件数"。
 
     Returns:
         tuple: (更新文件数, 最终 a_list, 最终 b_list)
@@ -160,21 +161,6 @@ def process_location_info(a_list, b_list, gps_data, threshold_minutes=30,
                     # 避免列表渲染读到预置坐标及对象与磁盘不一致
                     updated_files.append(result)
                     updated_in_iteration = True
-
-            if dry_run:
-                # 试运行：只记录"将写入"日志，不写盘、不移动文件。
-                # 单轮匹配结果即完整（本轮不改变任何状态），直接结束，
-                # 避免空转满 max_iterations 轮
-                for f, loc in updated_files:
-                    updated_count += 1
-                    try:
-                        if log_callback:
-                            log_callback(
-                                _("试运行: ") + f"{f.filename} - "
-                                + _("位置: ") + f"({loc['latitude']:.8f}, {loc['longitude']:.8f})")
-                    except Exception:
-                        log_exc()
-                break
 
             # 将本轮匹配到的文件写入实际的 GPS 数据
             if updated_files:
