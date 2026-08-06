@@ -100,7 +100,9 @@ def _reject_unsafe_xml(gpx_file_path):
                 # 根元素（或其它非 DTD 声明）出现，前导扫描结束
                 return False
     except Exception:
-        return False
+        # 读取异常（权限/损坏等）时按"可疑"处理拒绝解析（fail-closed）：
+        # ET.parse 也会失败，但返回 True 保证异常文件绝不进入解析路径
+        return True
     return False
 
 
@@ -176,57 +178,60 @@ def parse_gpx_file(gpx_file_path):
         if has_ns:
             ns_uri = root.tag.split('}')[0][1:]
             ns = {'gpx': ns_uri}
-            trkpt_path = './/gpx:trkpt'
+            point_paths = ['.//gpx:trkpt', './/gpx:rtept', './/gpx:wpt']
             ele_path = 'gpx:ele'
             time_path = 'gpx:time'
         else:
             ns = {}
-            trkpt_path = './/trkpt'
+            point_paths = ['.//trkpt', './/rtept', './/wpt']
             ele_path = 'ele'
             time_path = 'time'
 
-        # 查找所有轨迹点 <trkpt>
-        for trkpt in root.findall(trkpt_path, ns):
-            lat = trkpt.get('lat')
-            lon = trkpt.get('lon')
-            if lat is None or lon is None:
-                continue
+        # 轨迹点 <trkpt> / 路线点 <rtept> / 航点 <wpt> 都解析：
+        # 部分 GPX 生成器只输出 wpt/rtept（无 trkseg），只认 trkpt 会
+        # 误报"轨迹点 0 个，无法匹配"
+        for path in point_paths:
+            for pt in root.findall(path, ns):
+                lat = pt.get('lat')
+                lon = pt.get('lon')
+                if lat is None or lon is None:
+                    continue
 
-            # 海拔（可选）
-            ele_elem = trkpt.find(ele_path, ns)
-            ele = ele_elem.text if ele_elem is not None else None
+                # 海拔（可选）
+                ele_elem = pt.find(ele_path, ns)
+                ele = ele_elem.text if ele_elem is not None else None
 
-            # 时间（必需：无时间的轨迹点无法用于匹配）
-            time_elem = trkpt.find(time_path, ns)
-            time_str = time_elem.text if time_elem is not None else None
-            if time_str is None:
-                continue
+                # 时间（必需：无时间的轨迹点无法用于匹配）
+                time_elem = pt.find(time_path, ns)
+                time_str = time_elem.text if time_elem is not None else None
+                if time_str is None:
+                    continue
 
-            dt = parse_gpx_time(time_str)
-            if dt is None:
-                continue
+                dt = parse_gpx_time(time_str)
+                if dt is None:
+                    continue
 
-            # 单个坏点（非法/越界坐标）只跳过该点，不影响同文件其它有效点
-            try:
-                lat_v = float(lat)
-                lon_v = float(lon)
-                ele_v = float(ele) if ele is not None else None
-            except (ValueError, TypeError):
-                continue
-            if not -90 <= lat_v <= 90 or not -180 <= lon_v <= 180:
-                continue
-            if ele_v is not None and not (ele_v == ele_v):
-                # NaN 高度视为无高度
-                ele_v = None
+                # 单个坏点（非法/越界坐标）只跳过该点，不影响同文件其它有效点
+                try:
+                    lat_v = float(lat)
+                    lon_v = float(lon)
+                    ele_v = float(ele) if ele is not None else None
+                except (ValueError, TypeError):
+                    continue
+                if not -90 <= lat_v <= 90 or not -180 <= lon_v <= 180:
+                    continue
+                if ele_v is not None and not (ele_v == ele_v):
+                    # NaN 高度视为无高度
+                    ele_v = None
 
-            points.append({
-                'datetime': dt,
-                'latitude': lat_v,
-                'longitude': lon_v,
-                'altitude': ele_v,
-                'source': 'GPX',
-                'source_file': os.path.basename(gpx_file_path),
-            })
+                points.append({
+                    'datetime': dt,
+                    'latitude': lat_v,
+                    'longitude': lon_v,
+                    'altitude': ele_v,
+                    'source': 'GPX',
+                    'source_file': os.path.basename(gpx_file_path),
+                })
     except Exception:
         log_exc()
 

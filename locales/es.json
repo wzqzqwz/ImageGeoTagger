@@ -569,6 +569,8 @@
   "正在处理中，请等待当前任务完成后再退出程序": "Procesando, espere a que se complete la tarea actual antes de salir",
   "时间差阈值必须是整数，已还原为上次有效值: ": "El umbral de tiempo debe ser un entero, se restauró el último valor válido: ",
   "时间差阈值不能为负数，已还原为上次有效值: ": "El umbral de tiempo no puede ser negativo, se restauró el último valor válido: ",
+  "扫描时无法访问 {0} 个目录，已跳过": "Se omitieron {0} directorios inaccesibles",
+  "未修改任何文件，取消勾选试运行模式后再次处理将实际写入\n": "No se modific\u00f3 ning\u00fan archivo. Desmarque el modo de simulaci\u00f3n y procese de nuevo para escribir\n",
   "无法创建原文件备份，已中止写入: ": "No se pudo crear una copia de seguridad del archivo original, escritura cancelada: ",
   "操作被取消": "Operación cancelada"
 }

@@ -569,6 +569,8 @@
   "正在处理中，请等待当前任务完成后再退出程序": "Processing in progress, please wait for the current task to complete before exiting",
   "时间差阈值必须是整数，已还原为上次有效值: ": "Time threshold must be an integer, restored to the last valid value: ",
   "时间差阈值不能为负数，已还原为上次有效值: ": "Time threshold cannot be negative, restored to the last valid value: ",
+  "扫描时无法访问 {0} 个目录，已跳过": "Skipped {0} directories that could not be accessed",
+  "未修改任何文件，取消勾选试运行模式后再次处理将实际写入\n": "No files were modified. Uncheck dry run mode and process again to actually write\n",
   "无法创建原文件备份，已中止写入: ": "Unable to create a backup of the original file, write aborted: ",
   "操作被取消": "Operation cancelled"
 }

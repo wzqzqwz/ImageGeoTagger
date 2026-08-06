@@ -9,6 +9,7 @@
 import logging
 import os
 import sys
+import threading
 import traceback
 from logging.handlers import RotatingFileHandler
 
@@ -17,6 +18,8 @@ _LOG_FILE = os.path.join(_LOG_DIR, 'imagegeotagger.log')
 _LOGGER_NAME = 'igt'
 
 _initialized = False
+# 两线程同时首次调用时防止重复添加 handler（每行日志双写）
+_init_lock = threading.Lock()
 
 
 def setup_logging():
@@ -24,7 +27,10 @@ def setup_logging():
     global _initialized
     if _initialized:
         return
-    _initialized = True
+    with _init_lock:
+        if _initialized:
+            return
+        _initialized = True
 
     logger = logging.getLogger(_LOGGER_NAME)
     if logger.handlers:
@@ -60,7 +66,8 @@ def log_exc(context=''):
     """记录当前异常（含堆栈）到文件和控制台
 
     替代 traceback.print_exc()：打包版隐藏控制台后异常不再丢失。
-    可在 except 块内或任意位置调用（不在异常上下文时记录空堆栈，无副作用）。
+    只能在 except 块内调用；非异常上下文调用会记录空堆栈噪音，
+    直接返回空串。
 
     Args:
         context: 可选的上文说明，便于在长日志中定位
@@ -68,6 +75,9 @@ def log_exc(context=''):
     Returns:
         str: 完整堆栈文本（调用方如需透传原始信息可复用）
     """
+    if sys.exc_info()[0] is None:
+        # 非异常上下文：format_exc() 只会产生 "NoneType: None" 垃圾日志
+        return ''
     tb = traceback.format_exc()
     logger = logging.getLogger(_LOGGER_NAME)
     if logger.handlers:

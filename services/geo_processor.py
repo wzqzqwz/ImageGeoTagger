@@ -37,6 +37,11 @@ def _to_utc_naive(dt):
     因此这里统一把带时区的值先转成本地时间再剥离 tzinfo，
     保证带偏移值（如视频 +08:00）与本地 naive 值在同一条时间线上比较。
 
+    注意：名称中的 "utc" 仅表示"统一基准"（unified），语义是转本地
+    时间（astimezone() 使用本机时区），并非转 UTC。在"相机时区 == 本机
+    时区"的假设下自洽；跨时区拍摄、回国后处理的场景会系统性偏移，
+    需要 UI 层提供时区修正选项（当前未实现）。
+
     若 dt 已是 naive datetime，直接返回。
     """
     if dt is None:
@@ -49,7 +54,7 @@ def _to_utc_naive(dt):
 def process_location_info(a_list, b_list, gps_data, threshold_minutes=30,
                           max_iterations=10, progress_callback=None,
                           iteration_callback=None, log_callback=None,
-                          lock=None):
+                          lock=None, dry_run=False):
     """处理无 GPS 文件的位置信息
 
     通过时间匹配算法，为没有 GPS 坐标的文件分配位置。
@@ -64,12 +69,24 @@ def process_location_info(a_list, b_list, gps_data, threshold_minutes=30,
         progress_callback: 进度回调函数(百分比, 已处理, 总数, 标签)
         iteration_callback: 迭代回调函数(当前轮次, 总轮次)
         log_callback: 日志回调函数(消息字符串)
+        lock: 并发访问 a_list/b_list 的互斥锁
+        dry_run: 试运行模式。为 True 时只匹配与记录"将写入"日志，
+                不写盘、不移动文件；返回值 updated_count 表示
+                "将更新的文件数"。
 
     Returns:
         tuple: (更新文件数, 最终 a_list, 最终 b_list)
     """
     if lock is None:
         lock = threading.Lock()
+
+    # 重置上次运行遗留的写入失败重试计数：一次临时故障不应耗尽
+    # 后续运行的重试额度（_write_retries 存于文件对象上会跨运行累积）
+    with lock:
+        for img in b_list:
+            if getattr(img, '_write_retries', 0):
+                img._write_retries = 0
+
     updated_count = 0
 
     # 构建按时间排序的参考点列表（统一转为 UTC naive 再排序）
@@ -105,9 +122,11 @@ def process_location_info(a_list, b_list, gps_data, threshold_minutes=30,
                 iteration_callback(iteration, max_iterations)
 
             # 只处理有日期信息的文件（没有日期无法进行时间匹配）
+            # datetime.min（清空日期后的占位值）也视为无有效时间
             # 加锁快照迭代，避免与主线程列表修改产生 "list changed size during iteration"
             with lock:
-                b_with_time = [img for img in b_list if img.dt]
+                b_with_time = [img for img in b_list
+                               if img.dt and img.dt != datetime.min]
             total = len(b_with_time)
             processed = 0
 
@@ -141,6 +160,21 @@ def process_location_info(a_list, b_list, gps_data, threshold_minutes=30,
                     # 避免列表渲染读到预置坐标及对象与磁盘不一致
                     updated_files.append(result)
                     updated_in_iteration = True
+
+            if dry_run:
+                # 试运行：只记录"将写入"日志，不写盘、不移动文件。
+                # 单轮匹配结果即完整（本轮不改变任何状态），直接结束，
+                # 避免空转满 max_iterations 轮
+                for f, loc in updated_files:
+                    updated_count += 1
+                    try:
+                        if log_callback:
+                            log_callback(
+                                _("试运行: ") + f"{f.filename} - "
+                                + _("位置: ") + f"({loc['latitude']:.8f}, {loc['longitude']:.8f})")
+                    except Exception:
+                        log_exc()
+                break
 
             # 将本轮匹配到的文件写入实际的 GPS 数据
             if updated_files:
@@ -179,8 +213,13 @@ def process_location_info(a_list, b_list, gps_data, threshold_minutes=30,
                                 )
                     except Exception:
                         log_exc()
-                    if progress_callback:
-                        progress_callback(write_done / write_total * 100, write_done, write_total, _("写入进度"))
+                    try:
+                        if progress_callback:
+                            progress_callback(write_done / write_total * 100, write_done, write_total, _("写入进度"))
+                    except Exception:
+                        # 与匹配阶段一致：回调异常只记日志，不能中断收尾流程
+                        # （否则 moved_files 的列表迁移/统计被跳过，磁盘已写而 UI 状态失真）
+                        log_exc()
                 if moved_files:
                     # 批量移动分类：O(n) 重建列表，避免锁内逐文件 in/remove 的 O(n²)
                     with lock:
@@ -241,7 +280,7 @@ def _match_single_image(img_info, sorted_ref, threshold_minutes, max_retries=3):
     Returns:
         匹配成功返回 (MediaFileInfo, dict)，否则返回 None
     """
-    if img_info.dt is None:
+    if img_info.dt is None or img_info.dt == datetime.min:
         return None
 
     # 写入失败次数已达上限，不再重试
@@ -391,7 +430,11 @@ def find_files_with_same_location(app, target_lat, target_lon, target_alt,
         alt = f.altitude if hasattr(f, 'altitude') else None
         if lat is not None and lon is not None:
             if abs(lat - target_lat) < tolerance and abs(lon - target_lon) < tolerance:
-                if target_alt is None or alt is None or abs((alt or 0) - target_alt) < tolerance:
+                # 高度语义：目标无高度=不参与比较；目标有高度时
+                # 无高度文件（None）视为不相等，避免误匹配
+                if target_alt is None:
+                    matches.append(f)
+                elif alt is not None and abs(alt - target_alt) < tolerance:
                     matches.append(f)
     return matches
 
@@ -420,9 +463,11 @@ def batch_update_same_location_files(app, target_lat, target_lon, target_alt,
         try:
             loc = {'latitude': new_lat, 'longitude': new_lon, 'altitude': new_alt}
             _update_file_location(f.path if hasattr(f, 'path') else '', loc)
-            f.latitude = new_lat
-            f.longitude = new_lon
-            f.altitude = new_alt
+            # 属性回填加锁，避免与主线程列表渲染/结果窗口刷新并发读到半更新状态
+            with app.lock:
+                f.latitude = new_lat
+                f.longitude = new_lon
+                f.altitude = new_alt
             success += 1
         except Exception:
             log_exc()

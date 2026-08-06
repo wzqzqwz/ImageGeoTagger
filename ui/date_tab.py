@@ -63,7 +63,7 @@ def _no_clobber_rename(src, dst):
             os.rename(src, dst)
 
 
-# Fixed column identifiers (not translated - used as internal Treeview column IDs)
+# 内部 Treeview 列标识符（作为列 ID 使用，用户可见表头经 _() 翻译）
 _DATE_COL_IDS = ('序号', '文件名', '文件拍摄日期', '文件名日期', '新文件名', '状态')
 
 
@@ -359,6 +359,25 @@ class DateTab:
         self._apply_column_visibility()
         self._refilter_files_for_mode()
 
+    def _cached_original_dt(self, fi):
+        """解析并缓存 original_date 为 datetime，避免主线程逐文件重复 strptime
+
+        缓存键为 original_date 原始字符串：日期被处理/手动编辑更新后
+        字符串变化即自动失效，无需显式失效逻辑。
+        """
+        cached = fi.get('original_date')
+        cache = fi.get('_original_dt_cache')
+        if cache is None or cache[0] != cached:
+            dt = None
+            if cached:
+                try:
+                    dt = datetime.strptime(cached, '%Y-%m-%d %H:%M:%S')
+                except (ValueError, TypeError):
+                    dt = None
+            cache = (cached, dt)
+            fi['_original_dt_cache'] = cache
+        return cache[1]
+
     def _refilter_files_for_mode(self):
         mode = self.operation_mode.get()
         for fi in self.files_to_process:
@@ -375,12 +394,7 @@ class DateTab:
                 continue
             # 复用扫描时缓存的 original_date，避免主线程逐文件重读 EXIF 卡顿
             cached = fi.get('original_date')
-            existing = None
-            if cached:
-                try:
-                    existing = datetime.strptime(cached, '%Y-%m-%d %H:%M:%S')
-                except (ValueError, TypeError):
-                    existing = None
+            existing = self._cached_original_dt(fi) if cached else None
             if mode == "change_date":
                 if existing is not None and existing != datetime.min:
                     fi['status'] = FileStatus.NO_DATE_NEEDED
@@ -406,7 +420,10 @@ class DateTab:
                 self.app.root.after_cancel(self._rename_after_id)
             except Exception:
                 log_exc()
-        self._rename_after_id = self.app.root.after(500, self._on_rename_params_change)
+        # safe_after：主窗口已销毁时静默跳过，避免回调在销毁的 Treeview
+        # 上执行抛 TclError（_refresh_new_filenames 内部无 winfo_exists 兜底）
+        self._rename_after_id = safe_after(
+            self.app.root, 500, self._on_rename_params_change)
 
     def _apply_column_visibility(self):
         mode = self.operation_mode.get()
@@ -570,11 +587,14 @@ class DateTab:
         if not self.app.acquire_processing():
             messagebox.showwarning(_("警告"), _("其他任务正在处理中，请等待完成"), parent=self.app.root)
             return
-        # 主线程解析路径（Tk 调用不能在 worker 线程执行）
+        # 主线程解析路径（Tk 调用不能在 worker 线程执行）；
+        # 去重：同一路径被选中多次时只删除一次，避免重复删除误报失败
+        seen = set()
         paths = []
         for item_id in selected_items:
             values = self.date_tree.item(item_id, 'values')
-            if values and len(values) >= 7:
+            if values and len(values) >= 7 and values[6] not in seen:
+                seen.add(values[6])
                 paths.append(values[6])
 
         def worker():
@@ -956,13 +976,8 @@ class DateTab:
 
             if rename_mode:
                 # 复用扫描时缓存的 original_date，避免主线程逐文件重读 EXIF 卡顿
-                existing = None
                 cached = fi.get('original_date')
-                if cached:
-                    try:
-                        existing = datetime.strptime(cached, '%Y-%m-%d %H:%M:%S')
-                    except (ValueError, TypeError):
-                        existing = None
+                existing = self._cached_original_dt(fi) if cached else None
                 if st == FileStatus.SKIPPED:
                     if not existing or existing == datetime.min:
                         new_filename = _('无拍摄日期')
@@ -1033,9 +1048,8 @@ class DateTab:
             elif no_date:
                 new_fn = _('无拍摄日期')
             else:
-                try:
-                    dt = datetime.strptime(fi['original_date'], '%Y-%m-%d %H:%M:%S')
-                except Exception:
+                dt = self._cached_original_dt(fi)
+                if dt is None:
                     new_fn = _('无拍摄日期')
                 else:
                     fp = fi.get('path', '')
@@ -1192,7 +1206,6 @@ class DateTab:
         self._processing = True
         dry_run = self.dry_run.get()
         operation_mode = self.operation_mode.get()
-        self._export_mode = operation_mode
         skip_existing = self.skip_existing.get()
         rename_prefix_val = self.rename_prefix.get()
         rename_suffix_val = self.rename_suffix.get()
@@ -1266,13 +1279,8 @@ class DateTab:
         fp = fi['path']
         # 复用扫描时缓存的 original_date（扫描已按 fallback_to_fs 解析过），
         # 避免重命名模式对每个文件重复读盘解析 EXIF
-        existing = None
         cached = fi.get('original_date')
-        if cached:
-            try:
-                existing = datetime.strptime(cached, '%Y-%m-%d %H:%M:%S')
-            except (ValueError, TypeError):
-                existing = None
+        existing = self._cached_original_dt(fi) if cached else None
         if existing and existing != datetime.min:
             new_name = self._gen_new_name(fp, existing, fi, prefix=prefix_val, suffix=suffix_val)
             if new_name is None:
@@ -1671,7 +1679,9 @@ class DateTab:
                             fi.get('original_date') or '',
                             fi.get('new_date') or '',
                             status_text(fi.get('status'), fi.get('status_detail', '')),
-                            getattr(self, '_export_mode', self.operation_mode.get()),
+                            # 直接取当前模式：_export_mode 只在处理开始时更新，
+                            # 用户处理后再切换模式导出会导出陈旧值
+                            self.operation_mode.get(),
                         ])
             messagebox.showinfo(_("成功"), _("文件已保存到:\n") + filename)
         except Exception as e:

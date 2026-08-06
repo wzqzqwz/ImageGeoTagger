@@ -20,6 +20,7 @@ import shutil
 import tempfile
 import subprocess
 import json
+import math
 import threading
 import atexit
 import time
@@ -134,6 +135,15 @@ class _StayOpenWorker:
                 if '{ready}' in text:
                     break
                 out_parts.append(text)
+            # 等待 stderr 守护线程排空本命令的输出：ExifTool 在打印
+            # {ready} 之前已把本命令的 stderr 全部写入管道，滞后只来自
+            # 线程调度。短暂等待直到队列长度稳定，可保证错误文本归属
+            # 正确，避免把上一条命令的 stderr 算到本条头上（假成功）。
+            for _ in range(50):
+                cur = self._stderr_trimmed + len(self._stderr_lines)
+                time.sleep(0.005)
+                if cur == self._stderr_trimmed + len(self._stderr_lines):
+                    break
             # 取最近 lines_this_cmd 行：队列可能已被超限清理截断队首，
             # 但本命令自身的 stderr 必然位于队尾，取尾部即可正确还原
             lines_this_cmd = (self._stderr_trimmed + len(self._stderr_lines)) - stderr_start_total
@@ -155,6 +165,20 @@ class _StayOpenWorker:
         """
         with self.lock:
             enc = f'cp{self.code_page}' if os.name == 'nt' else 'utf-8'
+            # stay_open 协议按行传参：参数值含换行/回车会被 ExifTool
+            # 解析为额外参数行（POSIX 文件名可合法包含换行，属于注入面）；
+            # 系统代码页无法编码的字符若用 errors='replace' 会静默写错路径。
+            # 两种情况均拒绝执行，由调用方回退独立进程模式
+            # （argv 列表传参，无注入/编码损坏问题）。
+            for a in args:
+                if any(ch in a for ch in ('\n', '\r')):
+                    raise _PoolExecutionError(
+                        _("参数包含换行符，已回退独立进程模式"))
+                try:
+                    a.encode(enc)
+                except UnicodeEncodeError:
+                    raise _PoolExecutionError(
+                        _("文件名包含当前编码无法表示的字符，已回退独立进程模式"))
             for attempt in range(2):
                 try:
                     if self.dead or self.proc.poll() is not None:
@@ -214,6 +238,12 @@ class _ExifToolPool:
     def run(self, args, timeout=60):
         with self._sem:
             with self._in_use_lock:
+                if self.closed:
+                    # close() 已标记关闭并杀掉全部 worker：拒绝新命令，
+                    # 由调用方回退独立进程模式。若放行，worker.run 会在
+                    # 发现进程已死后 _restart() 复活孤儿 perl 进程
+                    # （池已不在缓存中，空闲回收计时器也不会再触发）。
+                    raise _PoolExecutionError(_("ExifTool 进程池已关闭"))
                 self._in_use += 1
             try:
                 with self._lock:
@@ -236,7 +266,10 @@ class _ExifToolPool:
         with self._in_use_lock:
             if self._in_use > 0:
                 return False
-        self.closed = True
+            # 与 run() 的 closed 检查处于同一把锁：closed 置位后任何
+            # 新到达的命令都会在进入前被拒绝，不会出现
+            # "close 完成后 worker 被 _restart() 复活"的孤儿进程竞态
+            self.closed = True
         for w in getattr(self, 'workers', []):
             try:
                 w.dead = True
@@ -385,7 +418,9 @@ def read_exif_datetime(file_path):
         with open(file_path, 'rb') as f:
             tags = exifread.process_file(f, details=False)
         return _exif_datetime_from_tags(tags)
-    except (OSError, ValueError, KeyError, struct.error):
+    except Exception:
+        # exifread 对畸形文件可能抛 TypeError/IndexError/AttributeError/
+        # UnicodeDecodeError 等非标准异常，统一兜底避免打穿调用线程
         log_exc()
         return None
 
@@ -405,7 +440,8 @@ def extract_exif_metadata(file_path):
     try:
         with open(file_path, 'rb') as f:
             tags = exifread.process_file(f, details=False)
-    except (OSError, ValueError, KeyError, struct.error):
+    except Exception:
+        # exifread 对畸形文件可能抛非标准异常（见 read_exif_datetime 说明）
         log_exc()
         return None, None, None, None
     return _exif_datetime_from_tags(tags), *_gps_from_tags(tags)
@@ -599,7 +635,7 @@ def _parse_video_time_detailed(time_str):
                 return parsed, False
             except ValueError:
                 continue
-    except (OSError, ValueError, KeyError, struct.error):
+    except Exception:
         log_exc()
     return None, False
 
@@ -698,17 +734,47 @@ def get_exiftool_cached():
         return _exiftool_cache['available'], _exiftool_cache['path']
 
 
+def _validate_location(location_info):
+    """校验 GPS 写入坐标：必须为有限数值且在合法范围内
+
+    NaN/Inf/越界/非数字值会写入损坏的 EXIF 或产生难以理解的报错，
+    统一在写入前拦截，抛出带上下文信息的 ValueError。
+
+    Returns:
+        tuple: (纬度, 经度, 高度或 None)
+    """
+    try:
+        lat = float(location_info['latitude'])
+        lon = float(location_info['longitude'])
+    except (KeyError, TypeError, ValueError):
+        raise ValueError(_("无效的 GPS 坐标: ") + repr(location_info))
+    if not (math.isfinite(lat) and math.isfinite(lon)):
+        raise ValueError(_("GPS 坐标必须为有限数值"))
+    if not -90 <= lat <= 90 or not -180 <= lon <= 180:
+        raise ValueError(_("GPS 坐标超出有效范围: ") + f"({lat}, {lon})")
+    alt = location_info.get('altitude')
+    if alt is not None:
+        try:
+            alt = float(alt)
+        except (TypeError, ValueError):
+            raise ValueError(_("无效的 GPS 高度: ") + repr(alt))
+        if not math.isfinite(alt):
+            raise ValueError(_("GPS 高度必须为有限数值"))
+    return lat, lon, alt
+
+
 def _build_gps_exiftool_args(location_info):
+    lat, lon, alt = _validate_location(location_info)
     args = [
-        f'-GPSLatitude={location_info["latitude"]}',
-        f'-GPSLongitude={location_info["longitude"]}',
-        f'-GPSLatitudeRef={"N" if location_info["latitude"] >= 0 else "S"}',
-        f'-GPSLongitudeRef={"E" if location_info["longitude"] >= 0 else "W"}',
+        f'-GPSLatitude={lat}',
+        f'-GPSLongitude={lon}',
+        f'-GPSLatitudeRef={"N" if lat >= 0 else "S"}',
+        f'-GPSLongitudeRef={"E" if lon >= 0 else "W"}',
     ]
-    if location_info.get('altitude') is not None:
+    if alt is not None:
         args += [
-            f'-GPSAltitude={abs(location_info["altitude"])}',
-            f'-GPSAltitudeRef={"0" if location_info["altitude"] >= 0 else "1"}'
+            f'-GPSAltitude={abs(alt)}',
+            f'-GPSAltitudeRef={"0" if alt >= 0 else "1"}'
         ]
     else:
         # 高度为空 = 清除文件中原有的 GPS 高度标签，
@@ -728,6 +794,7 @@ def update_image_gps(file_path, location_info):
         file_path: 图像文件路径
         location_info: 包含 latitude, longitude, altitude 的字典
     """
+    lat, lon, alt = _validate_location(location_info)
     orig_atime, orig_mtime = _get_stat(file_path)
     ext = os.path.splitext(file_path)[1].lower()
 
@@ -739,15 +806,15 @@ def update_image_gps(file_path, location_info):
 
         gps_ifd = {
             piexif.GPSIFD.GPSVersionID: (2, 2, 0, 0),
-            piexif.GPSIFD.GPSLatitudeRef: b'N' if location_info['latitude'] >= 0 else b'S',
-            piexif.GPSIFD.GPSLatitude: to_degrees(abs(location_info['latitude'])),
-            piexif.GPSIFD.GPSLongitudeRef: b'E' if location_info['longitude'] >= 0 else b'W',
-            piexif.GPSIFD.GPSLongitude: to_degrees(abs(location_info['longitude']))
+            piexif.GPSIFD.GPSLatitudeRef: b'N' if lat >= 0 else b'S',
+            piexif.GPSIFD.GPSLatitude: to_degrees(abs(lat)),
+            piexif.GPSIFD.GPSLongitudeRef: b'E' if lon >= 0 else b'W',
+            piexif.GPSIFD.GPSLongitude: to_degrees(abs(lon))
         }
 
-        if location_info.get('altitude') is not None:
-            gps_ifd[piexif.GPSIFD.GPSAltitudeRef] = 0 if location_info['altitude'] >= 0 else 1
-            abs_alt = abs(location_info['altitude'])
+        if alt is not None:
+            gps_ifd[piexif.GPSIFD.GPSAltitudeRef] = 0 if alt >= 0 else 1
+            abs_alt = abs(alt)
             if abs(abs_alt - round(abs_alt)) < 1e-9:
                 gps_ifd[piexif.GPSIFD.GPSAltitude] = (round(abs_alt), 1)
             else:
@@ -776,7 +843,7 @@ def update_image_gps(file_path, location_info):
                 pass
 
 
-def _run_exiftool(args, file_path, strict=False):
+def _run_exiftool(args, file_path, strict=False, external_backup=None):
     """运行 ExifTool 命令行工具
 
     使用固定的参数组合：
@@ -789,12 +856,16 @@ def _run_exiftool(args, file_path, strict=False):
     写前备份：覆盖写入前先把原文件完整复制到同目录（同盘，速度快，
     目录不可写时回退系统临时目录），写入成功后删除备份，任何异常路径
     （ExifTool 失败/被中断/严格校验不通过）都会自动用备份恢复原文件。
+    多方法串行写入（视频/音频多个容器逐个尝试）时传入 external_backup
+    只备份一次，避免每个方法都对大文件重复整文件复制。
 
     Args:
         args: ExifTool 参数列表
         file_path: 要处理的文件路径
         strict: 为 True 时，ExifTool 输出含警告
                 （如"标签不支持"）也视为失败，避免误报写入成功
+        external_backup: 由调用方创建并拥有的备份路径；传入时本函数
+                不再创建/删除备份，失败恢复仍使用该备份（所有权归调用方）
 
     Raises:
         Exception: ExifTool 不可用或运行失败
@@ -804,7 +875,9 @@ def _run_exiftool(args, file_path, strict=False):
         raise Exception(_("ExifTool 不可用，无法处理此文件"))
 
     # ---- 写前备份：保证失败时能恢复原始文件 ----
-    backup_path = _make_backup(file_path) if os.path.isfile(file_path) else None
+    owns_backup = external_backup is None
+    backup_path = external_backup if not owns_backup else (
+        _make_backup(file_path) if os.path.isfile(file_path) else None)
 
     # 清理上次异常退出残留的 ExifTool 临时文件（<name>_exiftool_tmp）。
     # ExifTool 使用 -overwrite_original 写盘时若检测到同名 tmp 已存在会拒绝写入
@@ -848,7 +921,8 @@ def _run_exiftool(args, file_path, strict=False):
     finally:
         # 仅在成功或备份已被原样恢复时才删除备份；
         # 恢复失败时备份已复制为 .igt_backup_*，此处不应再删。
-        if backup_path and os.path.exists(backup_path) and restore_ok:
+        # 外部传入的备份由调用方统一管理，此处不删除。
+        if owns_backup and backup_path and os.path.exists(backup_path) and restore_ok:
             try:
                 os.remove(backup_path)
             except OSError:
@@ -995,6 +1069,7 @@ def update_video_gps(file_path, location_info):
         file_path: 视频文件路径
         location_info: 包含 latitude, longitude, altitude 的字典
     """
+    _validate_location(location_info)
     orig_atime, orig_mtime = _get_stat(file_path)
 
     # 尝试五种不同的写入方法，支持不同视频格式的元数据容器。
@@ -1020,34 +1095,46 @@ def update_video_gps(file_path, location_info):
          f'-GPSLongitudeRef={"E" if location_info["longitude"] >= 0 else "W"}']
     ]
 
-    success = False
-    for method in methods:
-        try:
-            _run_exiftool(method, file_path, strict=True)
-            success = True
-            break
-        except Exception:
-            log_exc()
-            continue
+    # 多方法共用一份备份：避免每个方法都对大文件整文件复制，
+    # 方法失败由 _run_exiftool 用同一备份恢复原文件
+    backup_path = _make_backup(file_path)
+    try:
+        success = False
+        for method in methods:
+            try:
+                _run_exiftool(method, file_path, strict=True,
+                              external_backup=backup_path)
+                success = True
+                break
+            except Exception:
+                log_exc()
+                continue
 
-    # 高度独立补写：只有 XMP 组（及标准 GPS 组）支持 GPSAltitude，
-    # 覆盖 Keys/QuickTime/UserData 容器。高度写入失败不回滚已成功的 lat/lon。
-    if success and location_info.get('altitude') is not None:
-        try:
-            alt_method = [
-                f'-XMP:GPSAltitude={abs(location_info["altitude"])}',
-                f'-XMP:GPSAltitudeRef={"0" if location_info["altitude"] >= 0 else "1"}',
-                f'-GPSAltitude={abs(location_info["altitude"])}',
-                f'-GPSAltitudeRef={"0" if location_info["altitude"] >= 0 else "1"}',
-            ]
-            _run_exiftool(alt_method, file_path, strict=True)
-        except Exception:
-            log_exc()
+        # 高度独立补写：只有 XMP 组（及标准 GPS 组）支持 GPSAltitude，
+        # 覆盖 Keys/QuickTime/UserData 容器。高度写入失败不回滚已成功的 lat/lon。
+        if success and location_info.get('altitude') is not None:
+            try:
+                alt_method = [
+                    f'-XMP:GPSAltitude={abs(location_info["altitude"])}',
+                    f'-XMP:GPSAltitudeRef={"0" if location_info["altitude"] >= 0 else "1"}',
+                    f'-GPSAltitude={abs(location_info["altitude"])}',
+                    f'-GPSAltitudeRef={"0" if location_info["altitude"] >= 0 else "1"}',
+                ]
+                _run_exiftool(alt_method, file_path, strict=True,
+                              external_backup=backup_path)
+            except Exception:
+                log_exc()
 
-    if success:
-        os.utime(file_path, (orig_atime, orig_mtime))
-    else:
-        raise Exception(_("所有GPS写入方法均失败，不支持的视频文件格式"))
+        if success:
+            os.utime(file_path, (orig_atime, orig_mtime))
+        else:
+            raise Exception(_("所有GPS写入方法均失败，不支持的视频文件格式"))
+    finally:
+        if backup_path and os.path.exists(backup_path):
+            try:
+                os.remove(backup_path)
+            except OSError:
+                pass
 
 
 def update_audio_gps(file_path, location_info):
@@ -1059,6 +1146,7 @@ def update_audio_gps(file_path, location_info):
         file_path: 音频文件路径
         location_info: 包含 latitude, longitude, altitude 的字典
     """
+    _validate_location(location_info)
     orig_atime, orig_mtime = _get_stat(file_path)
     methods = [
         [f'-XMP:GPSLatitude={location_info["latitude"]}',
@@ -1071,30 +1159,40 @@ def update_audio_gps(file_path, location_info):
          f'-GPSLongitudeRef={"E" if location_info["longitude"] >= 0 else "W"}']
     ]
 
-    success = False
-    for method in methods:
-        try:
-            _run_exiftool(method, file_path, strict=True)
-            success = True
-            break
-        except Exception:
-            log_exc()
-            continue
+    # 多方法共用一份备份（见 update_video_gps 说明）
+    backup_path = _make_backup(file_path)
+    try:
+        success = False
+        for method in methods:
+            try:
+                _run_exiftool(method, file_path, strict=True,
+                              external_backup=backup_path)
+                success = True
+                break
+            except Exception:
+                log_exc()
+                continue
 
-# 高度独立补写（音频同视频：XMP 组支持 GPSAltitude）
-    if success and location_info.get('altitude') is not None:
-        try:
-            _run_exiftool([
-                f'-XMP:GPSAltitude={abs(location_info["altitude"])}',
-                f'-XMP:GPSAltitudeRef={"0" if location_info["altitude"] >= 0 else "1"}',
-            ], file_path, strict=True)
-        except Exception:
-            log_exc()
+    # 高度独立补写（音频同视频：XMP 组支持 GPSAltitude）
+        if success and location_info.get('altitude') is not None:
+            try:
+                _run_exiftool([
+                    f'-XMP:GPSAltitude={abs(location_info["altitude"])}',
+                    f'-XMP:GPSAltitudeRef={"0" if location_info["altitude"] >= 0 else "1"}',
+                ], file_path, strict=True, external_backup=backup_path)
+            except Exception:
+                log_exc()
 
-    if success:
-        os.utime(file_path, (orig_atime, orig_mtime))
-    else:
-        raise Exception(_("所有GPS写入方法均失败，不支持的音频文件格式"))
+        if success:
+            os.utime(file_path, (orig_atime, orig_mtime))
+        else:
+            raise Exception(_("所有GPS写入方法均失败，不支持的音频文件格式"))
+    finally:
+        if backup_path and os.path.exists(backup_path):
+            try:
+                os.remove(backup_path)
+            except OSError:
+                pass
 
 
 
@@ -1208,20 +1306,30 @@ def update_video_date(file_path, new_datetime):
         [f'-CreateDate={d}', f'-MediaCreateDate={d}'],
     ]
 
-    success = False
-    for method in methods:
-        try:
-            _run_exiftool(method, file_path, strict=True)
-            success = True
-            break
-        except Exception:
-            log_exc()
-            continue
+    # 多方法共用一份备份（见 update_video_gps 说明）
+    backup_path = _make_backup(file_path)
+    try:
+        success = False
+        for method in methods:
+            try:
+                _run_exiftool(method, file_path, strict=True,
+                              external_backup=backup_path)
+                success = True
+                break
+            except Exception:
+                log_exc()
+                continue
 
-    if success:
-        os.utime(file_path, (orig_atime, orig_mtime))
-    else:
-        raise Exception(_("所有日期写入方法均失败，不支持的视频文件格式"))
+        if success:
+            os.utime(file_path, (orig_atime, orig_mtime))
+        else:
+            raise Exception(_("所有日期写入方法均失败，不支持的视频文件格式"))
+    finally:
+        if backup_path and os.path.exists(backup_path):
+            try:
+                os.remove(backup_path)
+            except OSError:
+                pass
 
 
 def update_audio_date(file_path, new_datetime):
@@ -1236,20 +1344,30 @@ def update_audio_date(file_path, new_datetime):
         [f'-CreateDate={d}', f'-ModifyDate={d}'],
     ]
 
-    success = False
-    for method in methods:
-        try:
-            _run_exiftool(method, file_path, strict=True)
-            success = True
-            break
-        except Exception:
-            log_exc()
-            continue
+    # 多方法共用一份备份（见 update_video_gps 说明）
+    backup_path = _make_backup(file_path)
+    try:
+        success = False
+        for method in methods:
+            try:
+                _run_exiftool(method, file_path, strict=True,
+                              external_backup=backup_path)
+                success = True
+                break
+            except Exception:
+                log_exc()
+                continue
 
-    if success:
-        os.utime(file_path, (orig_atime, orig_mtime))
-    else:
-        raise Exception(_("所有日期写入方法均失败，不支持的音频文件格式"))
+        if success:
+            os.utime(file_path, (orig_atime, orig_mtime))
+        else:
+            raise Exception(_("所有日期写入方法均失败，不支持的音频文件格式"))
+    finally:
+        if backup_path and os.path.exists(backup_path):
+            try:
+                os.remove(backup_path)
+            except OSError:
+                pass
 
 
 def clear_audio_date(file_path):
@@ -1328,7 +1446,8 @@ def extract_exif_gps(file_path):
         with open(file_path, 'rb') as f:
             tags = exifread.process_file(f, details=False)
         return _gps_from_tags(tags)
-    except (OSError, ValueError, KeyError, struct.error):
+    except Exception:
+        # exifread 对畸形文件可能抛非标准异常（见 read_exif_datetime 说明）
         log_exc()
         return None, None, None
 
@@ -1380,7 +1499,7 @@ def extract_pil_gps(file_path):
                         if alt is not None and gps_data.get('GPSAltitudeRef', 0) == 1:
                             alt = -alt
                     return lat, lon, alt
-    except (OSError, ValueError, KeyError, struct.error, ZeroDivisionError, TypeError):
+    except Exception:
         log_exc()
     return None, None, None
 
@@ -1440,7 +1559,7 @@ def extract_video_gps_with_exiftool(file_path):
                             parsed = utc_dt.astimezone().replace(tzinfo=None)
                         video_time = parsed
                         break
-                except (OSError, ValueError, KeyError, struct.error):
+                except Exception:
                     log_exc()
                     continue
 
@@ -1448,52 +1567,52 @@ def extract_video_gps_with_exiftool(file_path):
             try:
                 lat = float(md['Composite:GPSLatitude'])
                 lon = float(md['Composite:GPSLongitude'])
-            except (OSError, ValueError, KeyError, struct.error):
+            except Exception:
                 log_exc()
         elif 'QuickTime:GPSCoordinates' in md:
             try:
                 c = md['QuickTime:GPSCoordinates'].split(',')
                 if len(c) >= 2:
                     lat, lon = float(c[0]), float(c[1])
-            except (OSError, ValueError, KeyError, struct.error):
+            except Exception:
                 log_exc()
         elif 'XMP:GPSLatitude' in md and 'XMP:GPSLongitude' in md:
             try:
                 lat, lon = float(md['XMP:GPSLatitude']), float(md['XMP:GPSLongitude'])
-            except (OSError, ValueError, KeyError, struct.error):
+            except Exception:
                 log_exc()
         elif 'Keys:GPSCoordinates' in md:
             try:
                 c = md['Keys:GPSCoordinates'].split(',')
                 if len(c) >= 2:
                     lat, lon = float(c[0]), float(c[1])
-            except (OSError, ValueError, KeyError, struct.error):
+            except Exception:
                 log_exc()
         elif 'UserData:GPSCoordinates' in md:
             try:
                 c = md['UserData:GPSCoordinates'].split(',')
                 if len(c) >= 2:
                     lat, lon = float(c[0]), float(c[1])
-            except (OSError, ValueError, KeyError, struct.error):
+            except Exception:
                 log_exc()
 
         if 'Composite:GPSAltitude' in md:
             try:
                 alt = float(md['Composite:GPSAltitude'])
-            except (OSError, ValueError, KeyError, struct.error):
+            except Exception:
                 log_exc()
         elif 'XMP:GPSAltitude' in md:
             try:
                 alt = float(md['XMP:GPSAltitude'])
-            except (OSError, ValueError, KeyError, struct.error):
+            except Exception:
                 log_exc()
         elif 'QuickTime:GPSAltitude' in md:
             try:
                 alt = float(md['QuickTime:GPSAltitude'])
-            except (OSError, ValueError, KeyError, struct.error):
+            except Exception:
                 log_exc()
 
         return lat, lon, alt, video_time
-    except (OSError, ValueError, KeyError, struct.error):
+    except Exception:
         log_exc()
         return None, None, None, None

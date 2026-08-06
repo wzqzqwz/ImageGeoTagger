@@ -21,7 +21,18 @@ from utils.gpx_utils import parse_gpx_file
 from utils.media_utils import get_file_creation_datetime
 from models.media_file import MediaFileInfo
 from models.gps_data import GpsPoint
-from utils.logging_utils import log_exc
+from utils.logging_utils import log_exc, log_warning
+
+
+def _sort_key(x):
+    """按拍摄时间排序的键：带时区的值统一转本地 naive 再比较"""
+    dt = x.dt if x.dt else datetime.min
+    if dt.tzinfo is not None:
+        try:
+            dt = dt.astimezone().replace(tzinfo=None)
+        except Exception:
+            dt = datetime.min
+    return dt
 
 
 def scan_folder(folder_path, progress_callback=None, only_process_with_date=False,
@@ -51,10 +62,13 @@ def scan_folder(folder_path, progress_callback=None, only_process_with_date=Fals
     files = []
 
     # 合并遍历：一次 os.walk 同时收集 GPX 和媒体文件
-    # onerror 只跳过无法访问的目录（打印日志继续遍历），
-    # 避免一个无权限子目录中断整个扫描导致文件/轨迹漏扫
+    # onerror 只统计无法访问的目录（跳过继续遍历），最后汇总一条日志，
+    # 避免每个无权限子目录都打一条日志刷屏；单个目录不可访问
+    # 不应中断整个扫描导致文件/轨迹漏扫
+    walk_errors = [0]
+
     def _on_walk_error(exc):
-        log_exc()
+        walk_errors[0] += 1
 
     try:
         if not os.path.isdir(folder_path):
@@ -76,6 +90,9 @@ def scan_folder(folder_path, progress_callback=None, only_process_with_date=Fals
                         ))
                 elif ext in ALL_MEDIA_EXTENSIONS:
                     files.append(os.path.join(r, f))
+        if walk_errors[0]:
+            log_warning(
+                _("扫描时无法访问 {0} 个目录，已跳过").format(walk_errors[0]))
     except PermissionError:
         pass
 
@@ -121,9 +138,10 @@ def scan_folder(folder_path, progress_callback=None, only_process_with_date=Fals
                         _last_log_pct = pct
                         log_callback(done, total)
 
-    # 按拍摄时间排序两个列表
-    a_list.sort(key=lambda x: x.dt if x.dt else datetime.min)
-    b_list.sort(key=lambda x: x.dt if x.dt else datetime.min)
+    # 按拍摄时间排序两个列表（带时区值统一转本地 naive 再比较，
+    # 与 geo_processor 的匹配基准一致，避免 aware/naive 混比抛 TypeError）
+    a_list.sort(key=_sort_key)
+    b_list.sort(key=_sort_key)
 
     return a_list, b_list, gps_data, total, skipped_count
 
@@ -149,9 +167,23 @@ def _extract_file_info(file_path, only_process_with_date=False):
     if ext not in ALL_MEDIA_EXTENSIONS:
         return info
 
-    # 视频/音频文件 - 使用 ExifTool 提取（音频没有标准 EXIF/PIL 可读，
+    # 音频文件：跳过 ExifTool 探测（音频极少含 GPS，且每次调用都要
+    # 启动一个子进程，批量扫描千级 MP3 时开销巨大），日期直接回退
+    # 文件系统创建/修改时间；视频仍需 ExifTool 提取 GPS 与时间
+    if ext in AUDIO_EXTENSIONS:
+        if not only_process_with_date:
+            dt = get_file_creation_datetime(Path(file_path))
+            if not dt:
+                try:
+                    dt = datetime.fromtimestamp(os.path.getmtime(file_path))
+                except Exception:
+                    dt = None
+            info.dt = dt
+        return info
+
+    # 视频文件 - 使用 ExifTool 提取（音频没有标准 EXIF/PIL 可读，
     # 走图像路径会导致 exifread 与 PIL 对每个音频文件抛异常刷屏）
-    if ext in VIDEO_EXTENSIONS or ext in AUDIO_EXTENSIONS:
+    if ext in VIDEO_EXTENSIONS:
         lat, lon, alt, dt = extract_video_gps_with_exiftool(file_path)
         info.latitude = lat
         info.longitude = lon

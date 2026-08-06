@@ -1072,11 +1072,11 @@ class BatchDateEditDialog:
         ttk.Label(dt_f, text=_("日期:"), font=('', 11)).pack(side=tk.LEFT, padx=(0, 6))
         self.date_entry = ttk.Entry(dt_f, width=11, font=('', 11))
         self.date_entry.pack(side=tk.LEFT, padx=(0, 15))
-        self.date_entry.insert(0, datetime.now().strftime('%Y-%m-%d'))
+        # 绝不预填当前日期/时间：与 EditShootingDateDialog 同一原则，
+        # 否则用户随手按回车就会把"今天"批量误写入所有选中文件
         ttk.Label(dt_f, text=_("时间:"), font=('', 11)).pack(side=tk.LEFT, padx=(0, 6))
         self.time_entry = ttk.Entry(dt_f, width=9, font=('', 11))
         self.time_entry.pack(side=tk.LEFT)
-        self.time_entry.insert(0, datetime.now().strftime('%H:%M:%S'))
 
         cp_frame = ttk.Frame(main)
         cp_frame.pack(pady=(0, 6))

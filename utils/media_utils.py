@@ -105,7 +105,8 @@ def get_file_creation_datetime(file_path):
     """
     try:
         stat_result = file_path.stat()
-        if hasattr(stat_result, 'st_birthtime') and stat_result.st_birthtime is not None:
+        # st_birthtime 为 0.0（少数平台未填充）会得到 1970 年时间，视为无值
+        if hasattr(stat_result, 'st_birthtime') and stat_result.st_birthtime and stat_result.st_birthtime > 0:
             return datetime.fromtimestamp(stat_result.st_birthtime)
         if platform.system() == 'Windows':
             return datetime.fromtimestamp(stat_result.st_ctime)

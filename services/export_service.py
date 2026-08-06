@@ -21,13 +21,14 @@ def _get_val(item, key, default=None):
 
 
 def csv_safe(value):
-    """CSV 单元格防公式注入：以 = + - @ 开头的值加单引号前缀
+    """CSV 单元格防公式注入：以 = + - @ \\t \\r 开头的值加单引号前缀
 
-    Excel 等表格软件会把这类单元格当作公式执行（如 =cmd|... ），
+    Excel 等表格软件会把这类单元格当作公式/DDE 执行（如 =cmd|... ），
+    部分旧版表格软件对 \\t/\\r 开头的单元格同样会解析为公式。
     文件名/路径等用户可控内容必须经过此处理。
     """
     s = str(value)
-    if s.startswith(('=', '+', '-', '@')):
+    if s.startswith(('=', '+', '-', '@', '\t', '\r')):
         return "'" + s
     return s
 
@@ -164,9 +165,9 @@ def export_to_json(filepath, a_list, b_list, gps_data):
         for point in gps_data:
             if isinstance(point, dict):
                 export_data['gps_track_data'].append({
-                    'datetime': point['datetime'].isoformat() if point['datetime'] else None,
-                    'latitude': _rc(point['latitude']),
-                    'longitude': _rc(point['longitude']),
+                    'datetime': point.get('datetime').isoformat() if point.get('datetime') else None,
+                    'latitude': _rc(point.get('latitude')),
+                    'longitude': _rc(point.get('longitude')),
                     'altitude': _rc(point.get('altitude'), 2),
                     'source_file': point.get('source_file'),
                 })

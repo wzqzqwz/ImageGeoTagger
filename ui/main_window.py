@@ -83,10 +83,6 @@ class MainWindow:
         with self.lock:
             self.is_processing = False
 
-    def is_task_running(self):
-        with self.lock:
-            return self.is_processing
-
     def register_thread(self, t):
         with self.lock:
             # 先清理已结束的线程，避免长时间会话中死线程无限堆积

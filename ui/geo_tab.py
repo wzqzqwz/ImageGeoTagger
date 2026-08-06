@@ -32,6 +32,8 @@ class GeoTab:
 
         self.time_threshold = tk.IntVar(value=30)
         self.only_process_with_date = tk.BooleanVar(value=True)
+        # GPS 处理默认试运行：与日期页一致，先预览匹配结果再实际写盘
+        self.dry_run = tk.BooleanVar(value=True)
 
         self.exiftool_available = None
         self.exiftool_path = None
@@ -50,6 +52,7 @@ class GeoTab:
         self._lbl_threshold.config(text=_("时间差阈值(分钟):"))
         self._lbl_default.config(text=_("(默认30分钟)"))
         self._chk_only_date.config(text=_("只处理有原始日期的文件"))
+        self._chk_dry_run.config(text=_("试运行模式"))
         self._btn_show.config(text=_("显示结果"))
         self._btn_export.config(text=_("导出结果"))
         self._lbl_result.config(text=_("处理结果:"))
@@ -87,6 +90,9 @@ class GeoTab:
         self._chk_only_date = ttk.Checkbutton(tfrm, text=_("只处理有原始日期的文件"),
                         variable=self.only_process_with_date)
         self._chk_only_date.pack(side=tk.LEFT, padx=(20, 0))
+        self._chk_dry_run = ttk.Checkbutton(tfrm, text=_("试运行模式"),
+                        variable=self.dry_run)
+        self._chk_dry_run.pack(side=tk.LEFT, padx=(10, 0))
 
         bfrm = ttk.Frame(self.frame)
         bfrm.pack(fill=tk.X, pady=(5, 2))
@@ -220,6 +226,7 @@ class GeoTab:
         self.process_btn.config(state=state)
         self._btn_show.config(state=state)
         self._btn_export.config(state=state)
+        self._chk_dry_run.config(state=state)
         if processing:
             return
         # 只清除"自己"的线程状态，避免旧线程的结束回调误清新线程状态
@@ -298,7 +305,9 @@ class GeoTab:
             return
         self._threshold_min_cache = threshold
         with self.app.lock:
-            t = threading.Thread(target=self._process_wrapper, daemon=True)
+            t = threading.Thread(
+                target=self._process_wrapper,
+                args=(self.dry_run.get(),), daemon=True)
             self.app.current_thread = t
         self.update_ui_state(True)
         self.app.register_thread(t)
@@ -313,9 +322,9 @@ class GeoTab:
         finally:
             self.root_after(lambda t=threading.current_thread(): self.update_ui_state(False, t))
 
-    def _process_wrapper(self):
+    def _process_wrapper(self, dry_run=False):
         try:
-            self.process_location_info()
+            self.process_location_info(dry_run=dry_run)
         except Exception as e:
             self.root_after(lambda e=e: messagebox.showerror(
                 _("错误"), _("处理位置信息时出错: ") + str(e)))
@@ -347,6 +356,7 @@ class GeoTab:
 
         # 节流：进度条按 1% 粒度更新，避免每个文件都排队 Tk 回调导致 UI 卡顿
         _last_pct = [None]
+        _last_log_pct = [-1]
 
         def progress_callback(pct):
             p = int(pct)
@@ -355,8 +365,13 @@ class GeoTab:
                 self.root_after(lambda: self.progress_var.set(p))
 
         def log_callback(done, total):
-            self.root_after(lambda d=done, t=total: self.status_var.set(
-                _("迭代进度: ") + str(d) + "/" + str(t)))
+            # 日志按百分比节流（每 5% 或最后一次），万级文件时避免
+            # 每个文件都往 UI 队列塞一条 lambda 造成主线程 Tcl 往返积压
+            pct = int(done / total * 100)
+            if pct > _last_log_pct[0] or done >= total:
+                _last_log_pct[0] = pct
+                self.root_after(lambda d=done, t=total: self.status_var.set(
+                    _("迭代进度: ") + str(d) + "/" + str(t)))
 
         a_list, b_list, gps_data, total_scanned, skipped_count = scan_folder(
             folder, progress_callback,
@@ -427,7 +442,7 @@ class GeoTab:
         self.root_after(lambda: self.progress_var.set(100))
         self.root_after(lambda: self.status_var.set(_("迭代进度: ") + str(total_scanned) + "/" + str(total_scanned)))
 
-    def process_location_info(self):
+    def process_location_info(self, dry_run=False):
         # 互斥与按钮状态已由 start_process_thread 在启动时设置
         with self.app.lock:
             has_b = bool(self.app.b)
@@ -446,7 +461,11 @@ class GeoTab:
 
         self.root_after(lambda: self.result_text.config(state='normal'))
         self.root_after(lambda: self.result_text.delete(1.0, tk.END))
-        self.root_after(lambda: self.result_text.insert(tk.END, _("正在处理位置信息...") + "\n\n"))
+        self.root_after(
+            lambda: self.result_text.insert(
+                tk.END,
+                (_("正在处理位置信息...") + " (" + _("试运行") + ") " if dry_run
+                 else _("正在处理位置信息...")) + "\n\n"))
         self.root_after(lambda: self.result_text.see(tk.END))
 
         # 节流：进度按 1% 粒度、日志每 20 个文件更新一次
@@ -485,6 +504,7 @@ class GeoTab:
             iteration_callback=iteration_callback,
             log_callback=log_callback,
             lock=self.app.lock,
+            dry_run=dry_run,
         )
 
         with self.app.lock:
@@ -497,7 +517,11 @@ class GeoTab:
             self.app.updated_count = updated
 
         summary = "\n" + _("===== 处理完成 =====") + "\n"
-        summary += _("更新文件总数: ") + str(updated) + "\n"
+        if dry_run:
+            summary += _("更新文件总数: ") + str(updated) + " (" + _("试运行") + ")\n"
+            summary += _("试运行: ") + _("未修改任何文件，取消勾选试运行模式后再次处理将实际写入\n")
+        else:
+            summary += _("更新文件总数: ") + str(updated) + "\n"
         summary += _("剩余没有位置信息的文件: ") + str(len(b_list)) + "\n"
         self.root_after(lambda: self.result_text.insert(tk.END, summary))
         self.root_after(lambda: self.result_text.see(tk.END))

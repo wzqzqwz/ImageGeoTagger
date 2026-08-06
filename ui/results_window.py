@@ -16,7 +16,7 @@ from utils.platform_utils import open_file_with_system, show_file_in_explorer
 from services.export_service import (
     generate_statistics
 )
-from ui.tk_safe import pulse_progress
+from ui.tk_safe import pulse_progress, safe_after
 from utils.i18n import _
 from utils.logging_utils import log_exc
 from utils.media_utils import format_gps_coord
@@ -255,6 +255,13 @@ class ResultsWindow:
 
         def do_search():
             search_job[0] = None
+            # 防抖期间窗口可能已被关闭：先确认 tree 存活，
+            # 避免在已销毁的 Treeview 上执行 Tcl 调用抛 TclError
+            try:
+                if not tree.winfo_exists():
+                    return
+            except Exception:
+                return
             text = search_var.get().lower().strip()
             filtered_data.clear()
             if not text:
@@ -281,10 +288,9 @@ class ResultsWindow:
                     tree.after_cancel(search_job[0])
                 except Exception:
                     pass
-            try:
-                search_job[0] = tree.after(150, do_search)
-            except Exception:
-                do_search()
+            # safe_after：结果窗口已关闭时静默跳过注册与触发；
+            # 不复用同步回退路径（窗口销毁时同步执行同样会抛 TclError）
+            search_job[0] = safe_after(tree, 150, do_search)
 
         search_var.trace_add('write', perform_search)
         search_fn.trace_add('write', perform_search)
@@ -450,7 +456,14 @@ class ResultsWindow:
         if not self.app.acquire_processing():
             messagebox.showwarning(_("警告"), _("其他任务正在处理中，请等待完成"), parent=self.window)
             return
-        paths = [i.path for i in items if hasattr(i, 'path')]
+        # 去重：同一路径被选中多次时只删除一次，避免重复删除误报失败
+        seen = set()
+        paths = []
+        for i in items:
+            p = i.path if hasattr(i, 'path') else None
+            if p is not None and p not in seen:
+                seen.add(p)
+                paths.append(p)
 
         def worker():
             success, failed = send_to_recycle_bin(paths)

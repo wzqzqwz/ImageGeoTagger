@@ -45,7 +45,9 @@ def load_lang(lang_code=None):
     except Exception:
         import sys
         print(f"Warning: Failed to load language file: {filepath}", file=sys.stderr)
-        _TRANSLATIONS = {}
+        # 加载失败时保留上一份可用翻译（若存在），避免界面退化为显示原文键
+        if not _TRANSLATIONS:
+            _TRANSLATIONS = {}
 
 def set_language(lang_code):
     """手动切换语言"""
