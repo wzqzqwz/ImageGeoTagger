@@ -128,7 +128,8 @@ def show_file_in_explorer(file_path):
     system = platform.system()
     try:
         if system == "Windows":
-            subprocess.run(['explorer', '/select,', abs_path], check=False, timeout=5)
+            # /select, 必须与路径连成单个参数，拆开时带空格路径无法定位文件
+            subprocess.run(['explorer', '/select,' + abs_path], check=False, timeout=5)
         elif system == "Darwin":
             subprocess.run(['open', '-R', abs_path], check=False, timeout=5)
         else:

@@ -50,17 +50,28 @@ def _no_clobber_rename(src, dst):
     else:
         try:
             os.link(src, dst)
-            os.unlink(src)
         except FileExistsError:
             raise
         except OSError:
-            # os.unlink 已成功但 os.link 抛错（基本不会出现）时，
-            # 源已消失表示重命名已完成，不再重复回退
+            # 跨分区（EXDEV）/文件系统不支持硬链接等：
+            # os.unlink 从未执行，源仍在，按原逻辑回退
             if not os.path.exists(src):
                 return
             if os.path.exists(dst):
                 raise FileExistsError(f"Destination exists: {dst}")
             os.rename(src, dst)
+        else:
+            # 硬链接已建立；源删除失败时若不清理目标，
+            # 源与目标会同时存在（磁盘双份文件），且调用方
+            # 会误以为"目标已存在"继续换编号名重试
+            try:
+                os.unlink(src)
+            except OSError:
+                try:
+                    os.remove(dst)
+                except OSError:
+                    pass
+                raise
 
 
 # 内部 Treeview 列标识符（作为列 ID 使用，用户可见表头经 _() 翻译）
@@ -598,7 +609,15 @@ class DateTab:
                 paths.append(values[6])
 
         def worker():
-            success, failed = send_to_recycle_bin(paths)
+            # 顶层兜底：回收站调用异常时线程不能静默死亡，
+            # 否则 release_processing 永不执行、全局互斥锁被永久占用
+            try:
+                success, failed = send_to_recycle_bin(paths)
+            except Exception as e:
+                log_exc()
+                # 兜底必须保存全路径：_apply_delete_results 用全路径
+                # 与列表项匹配，存 basename 会导致"文件未删但列表全移除"
+                success, failed = 0, [(p, str(e)) for p in paths]
             self.app.post_to_ui(
                 lambda s=success, f=failed, p=paths: self._apply_delete_results(s, f, p))
 
@@ -1241,6 +1260,12 @@ class DateTab:
             if st in (FileStatus.NO_DATE_NEEDED, FileStatus.NO_RENAME_NEEDED,
                       FileStatus.SKIPPED, FileStatus.RENAMED, FileStatus.DATE_CHANGED):
                 continue
+            # 手动重命名/手动编辑过的文件不再自动处理（与 _refilter_files_for_mode 一致）：
+            # 否则重命名模式会按手动编辑后的日期再次改名、
+            # 更改日期模式会重写手动重命名后文件的 EXIF 日期
+            if fi.get('manual_rename') or fi.get('manual_edit_date') or \
+                    st in (FileStatus.MANUALLY_RENAMED, FileStatus.MANUALLY_EDITED):
+                continue
             # 试运行状态仅表示预览结果：再次试运行（如修改前缀/后缀后）
             # 必须重新执行才能刷新预览，正式处理也须落地修改，
             # 因此 DRY_RUN 文件一律重新纳入待处理列表
@@ -1293,13 +1318,8 @@ class DateTab:
                 fi['_new_filename_display'] = new_name
                 if not dry_run:
                     new_path = os.path.join(os.path.dirname(fp), new_name)
-                    # 主处理路径同样检查目标存在性，防止覆盖已有文件
-                    if os.path.exists(new_path):
-                        fi['status'] = FileStatus.FAILED
-                        fi['status_detail'] = _("目标文件已存在: ") + new_name
-                        return
-                    # 多 worker 并发下 exists→rename 存在 TOCTOU 竞态：
-                    # 目标被其它 worker 抢占时立即改用编号名重试，避免整个文件失败
+                    # 目标存在性不在此预检：直接进入下方编号重试循环，
+                    # 与预览/批量路径的"存在则自动编号"行为保持一致
                     base_dir = os.path.dirname(fp)
                     orig_stem, ext = os.path.splitext(new_name)
                     target = new_path
@@ -1343,6 +1363,8 @@ class DateTab:
             else:
                 self._process_single_file_rename(fi, dry_run, rename_prefix_val, rename_suffix_val)
         except Exception as e:
+            # 编程错误/意外异常也写入日志，避免静默变成"失败: xxx"且无法排障
+            log_exc()
             fi['status'] = FileStatus.FAILED
             fi['status_detail'] = str(e)
 

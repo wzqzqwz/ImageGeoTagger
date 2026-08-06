@@ -119,7 +119,8 @@ def parse_gpx_time(time_str):
         datetime: 本地时间，解析失败返回 None
     """
     try:
-        if time_str.endswith('Z'):
+        # 兼容小写 z 后缀：GPX 1.1 规定用大写 Z，但部分生成器输出小写 z
+        if time_str and time_str[-1] in ('Z', 'z'):
             base_str = time_str[:-1]
             if '.' in base_str:
                 utc_time = datetime.strptime(base_str, "%Y-%m-%dT%H:%M:%S.%f")
@@ -129,7 +130,10 @@ def parse_gpx_time(time_str):
             return utc_time.astimezone().replace(tzinfo=None)
         elif '+' in time_str or time_str.count('-') > 2:
             try:
-                dt = datetime.fromisoformat(time_str.replace('Z', '+00:00'))
+                s = time_str
+                if s[-1:] in ('Z', 'z'):
+                    s = s[:-1] + '+00:00'
+                dt = datetime.fromisoformat(s)
                 return dt.astimezone().replace(tzinfo=None)
             except Exception:
                 log_exc()

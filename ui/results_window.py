@@ -300,12 +300,17 @@ class ResultsWindow:
 
         def on_double_click(event):
             item_id = tree.selection()[0] if tree.selection() else None
-            if item_id:
+            if not item_id:
+                return
+            try:
                 idx = tree.index(item_id)
-                if 0 <= idx < len(filtered_data):
-                    EditCoordinatesDialog(
-                        self.app, filtered_data[idx], tree, item_id,
-                        self.window, self)
+            except tk.TclError:
+                # 行已随刷新失效：跳过，避免双击时崩溃
+                return
+            if 0 <= idx < len(filtered_data):
+                EditCoordinatesDialog(
+                    self.app, filtered_data[idx], tree, item_id,
+                    self.window, self)
 
         tree.bind('<Double-1>', on_double_click)
 
@@ -321,9 +326,16 @@ class ResultsWindow:
             menu = tk.Menu(tree, tearoff=0)
 
             if len(sel) == 1:
-                idx = tree.index(sel[0])
+                try:
+                    idx = tree.index(sel[0])
+                except tk.TclError:
+                    # 行已随刷新失效：菜单无可用目标，直接返回
+                    return
                 if 0 <= idx < len(filtered_data):
                     fi = filtered_data[idx]
+                    # 菜单创建时解析为文件对象：点击菜单时若列表已刷新，
+                    # 旧 iid 可能指向另一个文件，删除/编辑会误伤
+                    sel_objs = [fi]
                     menu.add_command(label=_("打开"),
                                      command=lambda: open_file_with_system(fi.path))
                     if fi.latitude is not None and fi.longitude is not None:
@@ -350,20 +362,22 @@ class ResultsWindow:
                     menu.add_separator()
                     menu.add_command(
                         label=_("从序列中删除"),
-                        command=lambda: self._remove_items(tree, sel, filtered_data))
+                        command=lambda objs=sel_objs: self._remove_items(tree, objs, filtered_data))
                     menu.add_command(
                         label=_("从磁盘中删除"),
-                        command=lambda: self._delete_items(tree, sel, filtered_data))
+                        command=lambda objs=sel_objs: self._delete_items(tree, objs, filtered_data))
             else:
-                menu.add_command(label=_("从序列中删除"),
-                                 command=lambda: self._remove_items(tree, sel, filtered_data))
-                menu.add_command(label=_("从磁盘中删除"),
-                                 command=lambda: self._delete_items(tree, sel, filtered_data))
-                menu.add_separator()
                 # 菜单创建时一次性解析文件对象：sel 里的 iid 可能在后续
                 # 增删/刷新后失效（tree.index 抛 TclError），延迟到点击时
                 # 再解析会导致对象列表为空或错位
                 sel_objs = self._resolve_items(tree, sel, filtered_data)
+                if not sel_objs:
+                    return
+                menu.add_command(label=_("从序列中删除"),
+                                 command=lambda objs=sel_objs: self._remove_items(tree, objs, filtered_data))
+                menu.add_command(label=_("从磁盘中删除"),
+                                 command=lambda objs=sel_objs: self._delete_items(tree, objs, filtered_data))
+                menu.add_separator()
                 menu.add_command(
                     label=_("批量修改拍摄日期"),
                     command=lambda objs=sel_objs: BatchDateEditDialog(
@@ -416,7 +430,9 @@ class ResultsWindow:
         return items
 
     def _remove_items(self, tree, selected_items, filtered_data):
-        items = self._resolve_items(tree, selected_items, filtered_data)
+        # selected_items 已由右键菜单在创建时解析为文件对象
+        # （菜单点击时 iid 可能已随刷新失效，不能再按 iid 解析）
+        items = selected_items
 
         if not items:
             return
@@ -439,7 +455,9 @@ class ResultsWindow:
                        _("已从序列中删除 ") + str(len(items)) + _(" 个文件"))
 
     def _delete_items(self, tree, selected_items, filtered_data):
-        items = self._resolve_items(tree, selected_items, filtered_data)
+        # selected_items 已由右键菜单在创建时解析为文件对象，
+        # 不再按 iid 二次解析（菜单点击时 iid 可能已失效）
+        items = selected_items
 
         if not items:
             return
@@ -466,7 +484,15 @@ class ResultsWindow:
                 paths.append(p)
 
         def worker():
-            success, failed = send_to_recycle_bin(paths)
+            # 顶层兜底：回收站调用异常时线程不能静默死亡，
+            # 否则 release_processing 永不执行、全局互斥锁被永久占用
+            try:
+                success, failed = send_to_recycle_bin(paths)
+            except Exception as e:
+                log_exc()
+                # 兜底必须保存全路径：_apply_delete_results 用全路径
+                # 与列表项匹配，存 basename 会导致"文件未删但列表全移除"
+                success, failed = 0, [(p, str(e)) for p in paths]
             self.app.post_to_ui(
                 lambda s=success, f=failed: self._apply_delete_results(items, s, f))
 
@@ -533,6 +559,11 @@ class ResultsWindow:
                         gpx_tree.delete(item)
                     gpx_data_list = [p.to_dict() if hasattr(p, 'to_dict') else p
                                     for p in gps_data]
+                    state = getattr(gpx_tree, '_gpx_state', None)
+                    if state is not None:
+                        # data/indices 均从同一 gps_data 快照重建，保持平行
+                        state['data'] = gpx_data_list
+                        state['indices'] = list(range(len(gps_data)))
                     for i, point in enumerate(gpx_data_list):
                         time_str = point['datetime'].strftime('%Y-%m-%d %H:%M:%S') if point.get('datetime') else _('未知')
                         lat_str = format_gps_coord(point['latitude']) if point.get('latitude') is not None else _('未知')
@@ -540,9 +571,6 @@ class ResultsWindow:
                         alt_str = format_gps_coord(point['altitude']) if point.get('altitude') is not None else _('未知')
                         src = point.get('source_file', _('未知'))
                         gpx_tree.insert('', 'end', values=(i + 1, src, time_str, lat_str, lon_str, alt_str))
-                    state = getattr(gpx_tree, '_gpx_state', None)
-                    if state is not None:
-                        state['data'] = gpx_data_list
                 except Exception:
                     log_exc()
 
@@ -583,8 +611,11 @@ class ResultsWindow:
         self._gpx_count_label.pack(side=tk.LEFT)
 
         # 用可变容器保存当前轨迹点快照，refresh() 重建列表后更新它，
-        # 使右键菜单/双击等闭包始终引用最新数据
-        gpx_state = {'data': self._get_gpx_data_list()}
+        # 使右键菜单/双击等闭包始终引用最新数据。
+        # indices 与 data 平行，记录 data[i] 对应 self.app.gps_data 的下标，
+        # 删除时按行号精确定位，避免同时间同坐标的多个点按键值匹配误删
+        gpx_state = {'data': self._get_gpx_data_list(),
+                     'indices': list(range(len(self.app.gps_data)))}
 
         columns = ('seq', 'gpx_file', 'time', 'lat', 'lon', 'alt')
         tree = ttk.Treeview(frame, columns=columns, show='headings', height=14,
@@ -632,7 +663,11 @@ class ResultsWindow:
             menu = tk.Menu(tree, tearoff=0)
 
             if len(sel) == 1:
-                idx = tree.index(sel[0])
+                try:
+                    idx = tree.index(sel[0])
+                except tk.TclError:
+                    # 行已随刷新失效：菜单无可用目标，直接返回
+                    return
                 if 0 <= idx < len(gpx_data_list):
                     point = gpx_data_list[idx]
                     menu.add_command(label=_("查看详情"),
@@ -653,11 +688,14 @@ class ResultsWindow:
                                      command=lambda: self._export_gpx_point(point))
                     menu.add_command(label=_("删除此点"),
                                      command=lambda: self._remove_gpx_points(
-                                         tree, sel, gpx_data_list))
+                                         tree, sel, gpx_state))
             else:
                 selected_points = []
                 for s in sel:
-                    idx = tree.index(s)
+                    try:
+                        idx = tree.index(s)
+                    except tk.TclError:
+                        continue
                     if 0 <= idx < len(gpx_data_list):
                         selected_points.append(gpx_data_list[idx])
                 menu.add_command(
@@ -670,7 +708,7 @@ class ResultsWindow:
                 menu.add_command(
                     label=_("删除轨迹点"),
                     command=lambda pts=selected_points: self._remove_gpx_points(
-                        tree, sel, gpx_data_list))
+                        tree, sel, gpx_state))
 
             try:
                 menu.tk_popup(event.x_root, event.y_root)
@@ -740,49 +778,32 @@ class ResultsWindow:
             lines.append(_("高度范围: ") + f"{min(alts):.2f}" + _(" 到 ") + f"{max(alts):.2f}" + _(" 米"))
         messagebox.showinfo(_("轨迹点统计"), "\n".join(lines))
 
-    def _remove_gpx_points(self, tree, selected_items, gpx_data_list):
+    def _remove_gpx_points(self, tree, selected_items, gpx_state):
+        gpx_data_list = gpx_state['data']
+        indices = gpx_state['indices']
         count = len(selected_items)
         if not messagebox.askyesno(_("确认删除"), _("确定要从列表中删除这 ") + str(count) + _(" 个轨迹点吗？\n（不会删除原始 GPX 文件）")):
             return
-        # 按行值（时间, 纬度, 经度, 来源文件）匹配，不用快照下标删 live 列表，
-        # 避免扫描期间列表被重建后下标错位误删其它点
-        selected_keys = []
+        # 按行号定位选中项：树项存在即行号有效，行号对应 gpx_state 中的
+        # data/indices。同时间同坐标的多个点（如停车记录）按键值匹配会
+        # 删掉第一个而非用户选中的那一行，行号定位无此歧义。
+        selected_idx = []
         for s in selected_items:
             if not tree.exists(s):
                 continue
-            vals = tree.item(s, 'values')
-            if vals and len(vals) >= 6:
-                selected_keys.append((vals[2], vals[3], vals[4], vals[1]))
+            idx = tree.index(s)
+            if 0 <= idx < len(gpx_data_list):
+                selected_idx.append(idx)
 
-        def _key(d):
-            # gpx_data_list 是 dict，self.app.gps_data 是 GpsPoint 对象，两种都要兼容
-            if hasattr(d, 'timestamp'):
-                t = d.timestamp
-                lat, lon = d.latitude, d.longitude
-                src = d.source_file or ''
-            else:
-                t = d.get('datetime', '')
-                lat, lon = d.get('latitude'), d.get('longitude')
-                src = d.get('source_file', '') or ''
-            if hasattr(t, 'strftime'):
-                t = t.strftime('%Y-%m-%d %H:%M:%S')
-            lat = format_gps_coord(lat) if lat is not None else ''
-            lon = format_gps_coord(lon) if lon is not None else ''
-            return (t, lat, lon, src)
-
-        def _remove_first_matching(lst, key):
-            for i, d in enumerate(lst):
-                if _key(d) == key:
-                    del lst[i]
-                    return True
-            return False
-
-        # 快照列表与 live 列表各自按键删除；重复点只删除选中的个数（每键删一个）
-        for key in selected_keys:
-            _remove_first_matching(gpx_data_list, key)
+        # 降序删除：先删大下标，避免删除后下标前移错位
         with self.app.lock:
-            for key in selected_keys:
-                _remove_first_matching(self.app.gps_data, key)
+            for idx in sorted(set(selected_idx), reverse=True):
+                if idx < len(indices):
+                    live = indices[idx]
+                    del gpx_data_list[idx]
+                    del indices[idx]
+                    if 0 <= live < len(self.app.gps_data):
+                        del self.app.gps_data[live]
         for item in selected_items:
             try:
                 tree.delete(item)

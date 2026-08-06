@@ -38,7 +38,12 @@ class _MessageBoxDialog:
         self.window.geometry(f"{ww}x{wh}+{max(0,x)}+{max(0,y)}")
         self.window.resizable(False, False)
         self.window.transient(parent)
-        self.window.grab_set()
+        try:
+            # 嵌套模态（其它窗口已持有 grab）时 grab_set 抛 TclError：
+            # 对话框降级为非模态仍可用，不应中断构造
+            self.window.grab_set()
+        except tk.TclError:
+            pass
         self.window.protocol("WM_DELETE_WINDOW", self._on_close)
 
         if platform.system() == "Darwin":
@@ -153,7 +158,11 @@ class _AskStringDialog:
         self.window.geometry(f"{ww}x{wh}+{max(0,x)}+{max(0,y)}")
         self.window.resizable(False, False)
         self.window.transient(parent)
-        self.window.grab_set()
+        try:
+            # 嵌套模态时 grab_set 抛 TclError：降级为非模态仍可用
+            self.window.grab_set()
+        except tk.TclError:
+            pass
         self.window.protocol("WM_DELETE_WINDOW", self._on_cancel)
 
         main = ttk.Frame(self.window, padding=16)

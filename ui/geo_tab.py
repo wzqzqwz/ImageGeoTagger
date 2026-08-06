@@ -224,12 +224,27 @@ class GeoTab:
         self._btn_export.config(state=state)
         if processing:
             return
-        # 只清除"自己"的线程状态，避免旧线程的结束回调误清新线程状态
+        # 只清除"自己"的线程状态，避免旧线程的结束回调误清新线程状态。
+        # 迟到回调（thread 非 None 且不等于当前线程）一律不清理：
+        # 此时锁可能属于日期页/编辑对话框任务（它们不注册 current_thread），
+        # 误清 is_processing 会让两个任务并发写同一批文件导致损坏。
+        cleared = False
         with self.app.lock:
-            if thread is None or self.app.current_thread is thread:
+            if thread is None:
+                if self.app.current_thread is None:
+                    self.app.is_processing = False
+                    cleared = True
+            elif self.app.current_thread is thread:
                 self.app.current_thread = None
-            if self.app.current_thread is None:
                 self.app.is_processing = False
+                cleared = True
+        if not cleared:
+            # 锁仍被其它任务持有（本回调未清理任何状态）：
+            # 按钮保持禁用，避免 UI 显示可用而实际被互斥拒绝
+            self.extract_btn.config(state="disabled")
+            self.process_btn.config(state="disabled")
+            self._btn_show.config(state="disabled")
+            self._btn_export.config(state="disabled")
 
     def is_thread_running(self):
         with self.app.lock:
@@ -260,13 +275,10 @@ class GeoTab:
         self.result_text.see(tk.END)
         self.result_text.config(state='disabled')
 
+        # 扫描前不清空 app.a/app.b/gps_data：扫描失败或目录为空时
+        # 旧结果仍保留，避免用户已有数据被无提示清空。
+        # 新结果由 extract_image_info 在扫描成功后加锁整体替换。
         with self.app.lock:
-            self.app.a.clear()
-            self.app.b.clear()
-            self.app.gps_data.clear()
-            self.app.initial_a_count = 0
-            self.app.initial_b_count = 0
-            self.app.processed_count = 0
             t = threading.Thread(target=self._extract_wrapper, args=(folder,), daemon=True)
             self.app.current_thread = t
         self.app.register_thread(t)
@@ -290,10 +302,12 @@ class GeoTab:
             self.time_threshold.set(self._threshold_min_cache)
             self.app.release_processing()
             return
-        if threshold < 0:
+        if threshold < 0 or threshold == 0:
+            # 0 分钟在匹配阶段会被静默替换为默认值，为避免用户
+            # 期望"仅精确匹配"却实际按 30 分钟匹配，与负数一样直接拒绝
             messagebox.showwarning(
                 _("输入错误"),
-                _("时间差阈值不能为负数，已还原为上次有效值: ") + str(self._threshold_min_cache),
+                _("时间差阈值必须大于 0，已还原为上次有效值: ") + str(self._threshold_min_cache),
                 parent=self.app.root)
             self.time_threshold.set(self._threshold_min_cache)
             self.app.release_processing()
@@ -487,9 +501,25 @@ class GeoTab:
                     tk.END, _("===== 迭代 ") + str(iteration) + "/" + str(max_iter) + _(" =====\n")))
             self.root_after(lambda: self.result_text.see(tk.END))
 
+        # 处理阶段日志按 20 条合并成一批投递：写盘阶段对每个文件都会
+        # 回调一次（万级文件会产生数万条 Tk 回调），逐条插入+see 会
+        # 阻塞主线程且 Text 无限增长。合并后 Tk 往返减少 20 倍。
+        _log_batch = []
+        _LOG_BATCH_SIZE = 20
+
+        def _flush_log_batch():
+            if not _log_batch:
+                return
+            batch = "\n".join(_log_batch)
+            del _log_batch[:]
+            self.root_after(lambda b=batch: (
+                self.result_text.insert(tk.END, b + "\n"),
+                self.result_text.see(tk.END)))
+
         def log_callback(msg):
-            self.root_after(lambda: self.result_text.insert(tk.END, msg + "\n"))
-            self.root_after(lambda: self.result_text.see(tk.END))
+            _log_batch.append(msg)
+            if len(_log_batch) >= _LOG_BATCH_SIZE:
+                _flush_log_batch()
 
         updated, a_list, b_list = process_location_info(
             self.app.a, self.app.b, self.app.gps_data,
@@ -508,6 +538,9 @@ class GeoTab:
                 self.app.b.clear()
                 self.app.b.extend(b_list)
             self.app.updated_count = updated
+
+        # 收尾：把不足一满批的剩余日志一次性刷入界面
+        _flush_log_batch()
 
         summary = "\n" + _("===== 处理完成 =====") + "\n"
         summary += _("更新文件总数: ") + str(updated) + "\n"
@@ -549,10 +582,15 @@ class GeoTab:
 
         for url in urls:
             try:
-                webbrowser.open(url)
-                return
+                # webbrowser.open 失败时返回 False 而非抛异常：
+                # 必须检查返回值，否则首条 URL 打不开时后续备选永远不会尝试
+                if webbrowser.open(url):
+                    return
             except Exception:
+                log_exc()
                 continue
+        messagebox.showwarning(_("警告"), _("无法打开地图链接，请检查默认浏览器设置"),
+                               parent=self.app.root)
 
     def show_results(self):
         if self.is_thread_running():

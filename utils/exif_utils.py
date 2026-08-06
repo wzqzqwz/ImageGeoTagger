@@ -24,6 +24,7 @@ import math
 import threading
 import atexit
 import time
+import functools
 from collections import deque
 from datetime import datetime, timezone, timedelta
 
@@ -52,6 +53,44 @@ class _PoolExecutionError(Exception):
     """常驻进程池执行层故障（超时/进程退出等），调用方应回退独立进程模式"""
 
 
+# per-file 写锁：日期页/地理页/编辑对话框的任务可能并发写同一文件
+# （ExifTool 同名 tmp 文件互删、备份互相覆盖），按绝对路径串行化。
+_file_locks_guard = threading.Lock()
+_file_locks = {}
+
+
+def _per_file_lock(file_path):
+    key = os.path.abspath(file_path)
+    with _file_locks_guard:
+        lk = _file_locks.get(key)
+        if lk is None:
+            lk = threading.Lock()
+            _file_locks[key] = lk
+        return lk
+
+
+def _synchronized_file(func):
+    """装饰公开写入口：对同一文件的写入加 per-file 锁"""
+    @functools.wraps(func)
+    def wrapper(file_path, *args, **kwargs):
+        with _per_file_lock(file_path):
+            return func(file_path, *args, **kwargs)
+    return wrapper
+
+
+def _piexif_temp_path(file_path, ext):
+    """在目标同目录创建临时副本路径
+
+    与目标同卷，之后 os.replace 才是原子替换；
+    系统临时目录与目标跨卷时 shutil.move 会退化为
+    copy+delete，失败会截断原文件。
+    """
+    fd, temp_path = tempfile.mkstemp(prefix='.igt_tmp_', suffix=ext,
+                                     dir=os.path.dirname(os.path.abspath(file_path)))
+    os.close(fd)
+    return temp_path
+
+
 class _StayOpenWorker:
     """单个 ExifTool 常驻进程（-stay_open 模式）
 
@@ -68,6 +107,9 @@ class _StayOpenWorker:
         self.lock = threading.Lock()
         self.dead = False
         self._stderr_lines = deque()
+        # stderr 行由守护线程 append、命令线程 list() 读取，需要同一把锁，
+        # 否则迭代/长度读取与 append 并发会抛 RuntimeError（deque mutated）
+        self._stderr_lock = threading.Lock()
         # 已从队首丢弃的 stderr 行数（配合 _stderr_lines 还原真实序号）
         self._stderr_trimmed = 0
         self._start()
@@ -89,39 +131,48 @@ class _StayOpenWorker:
                 line = self.proc.stderr.readline()
                 if not line:
                     break
-                self._stderr_lines.append(line.decode(enc, errors='replace'))
-                # 只保留最近 2 万行：长会话大量 Warning 时避免内存无界增长
-                while len(self._stderr_lines) > 20000:
-                    self._stderr_lines.popleft()
-                    self._stderr_trimmed += 1
+                with self._stderr_lock:
+                    self._stderr_lines.append(line.decode(enc, errors='replace'))
+                    # 只保留最近 2 万行：长会话大量 Warning 时避免内存无界增长
+                    while len(self._stderr_lines) > 20000:
+                        self._stderr_lines.popleft()
+                        self._stderr_trimmed += 1
         except Exception:
             pass
 
-    def _kill(self):
+    def _kill(self, proc=None):
+        # 超时看门狗必须杀"创建时捕获的那个进程"：若期间进程已被
+        # _restart 替换，操作 self.proc 会杀掉新进程导致无谓失败
+        target = proc if proc is not None else self.proc
         try:
-            self.proc.kill()
+            target.kill()
         except Exception:
             pass
         try:
-            self.proc.wait(timeout=5)
+            target.wait(timeout=5)
         except Exception:
             pass
 
     def _restart(self):
         self._kill()
         self.dead = False
-        self._stderr_lines.clear()
-        self._stderr_trimmed = 0
+        with self._stderr_lock:
+            self._stderr_lines.clear()
+            self._stderr_trimmed = 0
         self._start()
 
     # ---------- 命令执行 ----------
     def _run_command(self, args, enc, timeout):
         # 超时看门狗：readline 是阻塞调用，超时只能靠杀进程解除
-        watchdog = threading.Timer(timeout, self._kill)
+        watchdog = threading.Timer(timeout, self._kill, args=(self.proc,))
         watchdog.daemon = True
         watchdog.start()
         try:
-            stderr_start_total = self._stderr_trimmed + len(self._stderr_lines)
+            def _stderr_count():
+                with self._stderr_lock:
+                    return self._stderr_trimmed + len(self._stderr_lines)
+
+            stderr_start_total = _stderr_count()
             data = ''.join(a + '\n' for a in args) + '-execute\n'
             self.proc.stdin.write(data.encode(enc, errors='replace'))
             self.proc.stdin.flush()
@@ -140,14 +191,15 @@ class _StayOpenWorker:
             # 线程调度。短暂等待直到队列长度稳定，可保证错误文本归属
             # 正确，避免把上一条命令的 stderr 算到本条头上（假成功）。
             for _i in range(50):
-                cur = self._stderr_trimmed + len(self._stderr_lines)
+                cur = _stderr_count()
                 time.sleep(0.005)
-                if cur == self._stderr_trimmed + len(self._stderr_lines):
+                if cur == _stderr_count():
                     break
             # 取最近 lines_this_cmd 行：队列可能已被超限清理截断队首，
             # 但本命令自身的 stderr 必然位于队尾，取尾部即可正确还原
-            lines_this_cmd = (self._stderr_trimmed + len(self._stderr_lines)) - stderr_start_total
-            texts = list(self._stderr_lines)
+            lines_this_cmd = _stderr_count() - stderr_start_total
+            with self._stderr_lock:
+                texts = list(self._stderr_lines)
             if lines_this_cmd > 0:
                 stderr_text = ''.join(
                     texts[max(0, len(texts) - lines_this_cmd):]).rstrip('\n')
@@ -378,7 +430,8 @@ def _get_stat(file_path):
 
 
 def _now_str():
-    return datetime.now().strftime('%Y%m%d-%H%M%S')
+    # 毫秒精度：同一秒内多次备份保留时不会被互相覆盖
+    return datetime.now().strftime('%Y%m%d-%H%M%S%f')[:-3]
 
 
 def _exif_datetime_from_tags(tags):
@@ -605,9 +658,10 @@ def _parse_video_time_detailed(time_str):
             "%Y-%m-%dT%H:%M:%S.%fZ",
         ]
         is_utc = False
-        if time_str.endswith('Z') or 'UTC' in time_str.upper():
+        # 兼容小写 z 后缀（部分非标准生成器输出），统一按 UTC 处理
+        if time_str[-1:] in ('Z', 'z') or 'UTC' in time_str.upper():
             is_utc = True
-            time_str = time_str.replace('Z', '').replace('UTC', '').strip()
+            time_str = time_str.rstrip('Zz').replace('UTC', '').strip()
 
         # 显式时区偏移（ExifTool 常输出 ...+08:00 / ...-05:00）：
         # 用带 %z 的格式解析，再转成本地时间，保证与照片/GPX 的
@@ -783,6 +837,7 @@ def _build_gps_exiftool_args(location_info):
     return args
 
 
+@_synchronized_file
 def update_image_gps(file_path, location_info):
     """将 GPS 信息写入图像文件
 
@@ -798,8 +853,9 @@ def update_image_gps(file_path, location_info):
     orig_atime, orig_mtime = _get_stat(file_path)
     ext = os.path.splitext(file_path)[1].lower()
 
-    with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as temp_file:
-        temp_path = temp_file.name
+    # 同目录临时副本 + os.replace 原子替换；同目录不可写时抛错，
+    # 由 except 分支回退 ExifTool（其写前备份与恢复路径更安全）
+    temp_path = _piexif_temp_path(file_path, ext)
     try:
         shutil.copy2(file_path, temp_path)
         exif_dict = piexif.load(temp_path)
@@ -830,7 +886,7 @@ def update_image_gps(file_path, location_info):
             piexif.load(temp_path)
         except Exception:
             raise Exception(_("写入结果EXIF结构无效"))
-        shutil.move(temp_path, file_path)
+        os.replace(temp_path, file_path)
         os.utime(file_path, (orig_atime, orig_mtime))
     except Exception:
         log_exc()
@@ -1020,16 +1076,27 @@ def _validate_exiftool_result(stdout_text, stderr_text, strict, file_path, tool_
     msg = stderr.strip() or (stdout_text or "").strip()
 
     if "Error" in stderr or "not yet supported" in stderr:
-        if "FileName encoding must be specified" in stderr:
-            # 老版本 ExifTool 未指定文件名编码时直接失败：用系统代码页编码重试
-            out2, err2 = _execute_exiftool(
-                tool_path, ['-charset', 'filename=cp' + str(_system_codepage())] + list(args), file_path)
-            if ("Error" in (err2 or "") or "not yet supported" in (err2 or "")) \
-                    or "FileName encoding must be specified" in (err2 or ""):
-                if "FileName encoding must be specified" in (err2 or ""):
-                    raise Exception(_("文件名包含非ASCII字符，处理失败"))
-                # 重试后仍有其它真实错误（如格式不支持）：透传实际错误信息
+        # 仅老版本 ExifTool（10.x）把文件名编码问题作为 Error 抛出时才重试；
+        # ExifTool 13.x 经 Unicode API 传参，对编码只打 Warning（可正常写入），
+        # 且部分 charset 名（cp936/GB2312）会被拒绝，此时不应进入重试。
+        if "Error: FileName encoding" in stderr:
+            # 老版本 ExifTool（10.x）无 Unicode 传参支持，需指定系统代码页
+            # 字符集重试。重试失败时透传原始错误，避免误报为编码问题。
+            charset_name = {936: 'GB2312', 932: 'ShiftJIS', 949: 'KSC',
+                            950: 'Big5'}.get(_system_codepage(), 'Latin1')
+            try:
+                out2, err2 = _execute_exiftool(
+                    tool_path, ['-charset', 'filename=' + charset_name] + list(args),
+                    file_path)
+            except Exception:
+                log_exc()
+                raise Exception((stderr or "").strip()[:500])
+            if "Error" in (err2 or "") or "not yet supported" in (err2 or ""):
+                # 重试后仍有真实错误（如格式不支持）：透传实际错误信息
                 raise Exception((err2 or "").strip()[:500])
+            if "Error: FileName encoding" in (err2 or ""):
+                # 字符集名不被当前版本接受（或仍无法编码）：透传原始错误
+                raise Exception((stderr or "").strip()[:500])
             return
         if "not yet supported" in stderr:
             ext = os.path.splitext(file_path)[1].lower()
@@ -1052,6 +1119,7 @@ def _write_gps_with_exiftool(file_path, location_info, orig_atime, orig_mtime):
     os.utime(file_path, (orig_atime, orig_mtime))
 
 
+@_synchronized_file
 def update_raw_gps(file_path, location_info):
     orig_atime, orig_mtime = _get_stat(file_path)
     gpscmd = _build_gps_exiftool_args(location_info)
@@ -1059,6 +1127,7 @@ def update_raw_gps(file_path, location_info):
     os.utime(file_path, (orig_atime, orig_mtime))
 
 
+@_synchronized_file
 def update_video_gps(file_path, location_info):
     """使用 ExifTool 将 GPS 信息写入视频文件
 
@@ -1137,6 +1206,7 @@ def update_video_gps(file_path, location_info):
                 pass
 
 
+@_synchronized_file
 def update_audio_gps(file_path, location_info):
     """使用 ExifTool 将 GPS 信息写入音频文件（通过 XMP 标签）
 
@@ -1196,6 +1266,7 @@ def update_audio_gps(file_path, location_info):
 
 
 
+@_synchronized_file
 def remove_gps_info(file_path):
     """从文件中移除所有 GPS 信息
 
@@ -1212,15 +1283,21 @@ def remove_gps_info(file_path):
     if ext in RAW_EXTENSIONS or ext in VIDEO_EXTENSIONS or ext in AUDIO_EXTENSIONS:
         _run_exiftool(['-GPS*=', '-XMP:GPS*='], file_path)
     else:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as temp_file:
-            temp_path = temp_file.name
+        try:
+            temp_path = _piexif_temp_path(file_path, ext)
+        except Exception:
+            log_exc()
+            _run_exiftool(['-GPS*=', '-XMP:GPS*='], file_path)
+            os.utime(file_path, (orig_atime, orig_mtime))
+            return
         try:
             shutil.copy2(file_path, temp_path)
             exif_dict = piexif.load(temp_path)
             exif_dict["GPS"] = {}
             piexif.insert(piexif.dump(exif_dict), temp_path)
-            shutil.move(temp_path, file_path)
+            os.replace(temp_path, file_path)
         except Exception:
+            log_exc()
             _run_exiftool(['-GPS*=', '-XMP:GPS*='], file_path)
         finally:
             if os.path.exists(temp_path):
@@ -1228,10 +1305,18 @@ def remove_gps_info(file_path):
                     os.remove(temp_path)
                 except OSError:
                     pass
+        # piexif 只清 EXIF GPS IFD；部分文件（视频转存、相机直写 XMP）
+        # 同时在 XMP 组存有 GPS 坐标，补一次 XMP 清理避免删除不彻底。
+        # ExifTool 不可用时忽略（EXIF GPS 已清除，XMP 残留不影响读取优先级）
+        try:
+            _run_exiftool(['-XMP:GPS*='], file_path)
+        except Exception:
+            log_exc()
 
     os.utime(file_path, (orig_atime, orig_mtime))
 
 
+@_synchronized_file
 def update_image_date(file_path, new_datetime):
     """将日期信息写入图像文件
 
@@ -1245,8 +1330,8 @@ def update_image_date(file_path, new_datetime):
     orig_atime, orig_mtime = _get_stat(file_path)
     ext = os.path.splitext(file_path)[1].lower()
 
-    with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as temp_file:
-        temp_path = temp_file.name
+    # 同目录临时副本 + os.replace 原子替换（见 update_image_gps 说明）
+    temp_path = _piexif_temp_path(file_path, ext)
     try:
         shutil.copy2(file_path, temp_path)
         exif_dict = piexif.load(temp_path)
@@ -1261,7 +1346,7 @@ def update_image_date(file_path, new_datetime):
         piexif.insert(piexif.dump(exif_dict), temp_path)
         if os.path.getsize(temp_path) == 0:
             raise Exception(_("写入结果为空文件"))
-        shutil.move(temp_path, file_path)
+        os.replace(temp_path, file_path)
         os.utime(file_path, (orig_atime, orig_mtime))
     except Exception:
         log_exc()
@@ -1284,6 +1369,7 @@ def _write_date_with_exiftool(file_path, new_datetime, orig_atime, orig_mtime):
     os.utime(file_path, (orig_atime, orig_mtime))
 
 
+@_synchronized_file
 def update_raw_date(file_path, new_datetime):
     """使用 ExifTool 将日期写入 RAW 文件"""
     orig_atime, orig_mtime = _get_stat(file_path)
@@ -1293,6 +1379,7 @@ def update_raw_date(file_path, new_datetime):
     os.utime(file_path, (orig_atime, orig_mtime))
 
 
+@_synchronized_file
 def update_video_date(file_path, new_datetime):
     """使用 ExifTool 将日期写入视频文件（尝试多种标签路径）"""
     orig_atime, orig_mtime = _get_stat(file_path)
@@ -1332,6 +1419,7 @@ def update_video_date(file_path, new_datetime):
                 pass
 
 
+@_synchronized_file
 def update_audio_date(file_path, new_datetime):
     """使用 ExifTool 将日期写入音频文件（通过 XMP 标签）"""
     orig_atime, orig_mtime = _get_stat(file_path)
@@ -1370,6 +1458,7 @@ def update_audio_date(file_path, new_datetime):
                 pass
 
 
+@_synchronized_file
 def clear_audio_date(file_path):
     """清除音频文件中的所有日期标签"""
     orig_atime, orig_mtime = _get_stat(file_path)
@@ -1377,6 +1466,7 @@ def clear_audio_date(file_path):
     os.utime(file_path, (orig_atime, orig_mtime))
 
 
+@_synchronized_file
 def blank_exif_dates(file_path):
     """使用 ExifTool 清空 EXIF 日期标签
 
@@ -1390,6 +1480,7 @@ def blank_exif_dates(file_path):
     os.utime(file_path, (orig_atime, orig_mtime))
 
 
+@_synchronized_file
 def clear_video_date(file_path):
     """清除视频文件中的所有日期标签"""
     orig_atime, orig_mtime = _get_stat(file_path)
@@ -1472,6 +1563,15 @@ def extract_pil_gps(file_path):
             for tag, val in exif_data.items():
                 tname = TAGS.get(tag, tag)
                 if tname == 'GPSInfo':
+                    if isinstance(val, int):
+                        # Pillow 10+ 的 getexif() 对 GPSInfo 只返回 IFD 偏移
+                        # （int），必须经 get_ifd 展开成实际标签字典，
+                        # 否则 val.items() 抛 AttributeError 被跳过、GPS 恒为 None
+                        try:
+                            val = exif_data.get_ifd(tag)
+                        except Exception:
+                            log_exc()
+                            return None, None, None
                     gps_data = {}
                     try:
                         items = val.items()
@@ -1485,9 +1585,11 @@ def extract_pil_gps(file_path):
                         latv, lonv = gps_data['GPSLatitude'], gps_data['GPSLongitude']
                         lat = float(latv[0]) + float(latv[1]) / 60 + float(latv[2]) / 3600
                         lon = float(lonv[0]) + float(lonv[1]) / 60 + float(lonv[2]) / 3600
-                        if gps_data.get('GPSLatitudeRef', 'N') == 'S':
+                        # Pillow 对部分文件返回 bytes（如 b'S'），统一转 str 再比较，
+                        # 否则南纬/西经会因 b'S' != 'S' 被误判为北纬/东经
+                        if str(gps_data.get('GPSLatitudeRef', 'N')).upper() == 'S':
                             lat = -lat
-                        if gps_data.get('GPSLongitudeRef', 'E') == 'W':
+                        if str(gps_data.get('GPSLongitudeRef', 'E')).upper() == 'W':
                             lon = -lon
                     if 'GPSAltitude' in gps_data:
                         v = gps_data['GPSAltitude']
@@ -1502,6 +1604,58 @@ def extract_pil_gps(file_path):
     except Exception:
         log_exc()
     return None, None, None
+
+
+_DATE_TAG_KEYS = (
+    'EXIF:DateTimeOriginal', 'Composite:DateTimeOriginal',
+    'EXIF:CreateDate', 'EXIF:DateTimeDigitized',
+    'QuickTime:MediaCreateDate', 'QuickTime:CreateDate',
+    'QuickTime:CreationDate', 'Keys:CreationDate',
+    'XMP:CreateDate', 'XMP:DateCreated',
+)
+
+
+def extract_media_datetime_exiftool(file_path):
+    """使用 ExifTool 读取媒体文件的拍摄日期（RAW/HEIC/WebP/视频/音频等）
+
+    exifread/QuickTime 二进制解析覆盖不了 RAW、HEIC、WebP、MKV/AVI 等
+    容器；「跳过已有日期」等需要准确判断文件是否已有拍摄日期的场景
+    必须依赖 ExifTool 读取，否则会把已有日期的文件误判为无日期而覆盖。
+
+    Args:
+        file_path: 文件路径
+
+    Returns:
+        datetime or None: 读取失败或 ExifTool 不可用时返回 None
+    """
+    available, tool_path = get_exiftool_cached()
+    if not available:
+        return None
+    try:
+        with _exiftool_semaphore:
+            r = subprocess.run([tool_path, '-j', '-G', '-n', file_path],
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               text=True, timeout=30, startupinfo=get_startupinfo(),
+                               errors='replace')
+        if r.returncode != 0:
+            return None
+        md_list = json.loads(r.stdout)
+        if not isinstance(md_list, list) or not md_list or not isinstance(md_list[0], dict):
+            return None
+        md = md_list[0]
+        for key in _DATE_TAG_KEYS:
+            if key in md and md[key]:
+                parsed, had_tz = _parse_video_time_detailed(str(md[key]))
+                if parsed:
+                    # QuickTime 时间始终为 UTC（即使输出不带 Z 后缀），
+                    # 与 extract_video_gps_with_exiftool 的语义保持一致
+                    if key.startswith('QuickTime:') and not had_tz:
+                        utc_dt = parsed.replace(tzinfo=timezone.utc)
+                        parsed = utc_dt.astimezone().replace(tzinfo=None)
+                    return parsed
+    except (ValueError, TypeError, OSError, subprocess.SubprocessError):
+        log_exc()
+    return None
 
 
 def extract_video_gps_with_exiftool(file_path):

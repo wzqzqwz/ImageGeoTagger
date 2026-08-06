@@ -570,7 +570,20 @@
   "时间差阈值必须是整数，已还原为上次有效值: ": "El umbral de tiempo debe ser un entero, se restauró el último valor válido: ",
   "时间差阈值不能为负数，已还原为上次有效值: ": "El umbral de tiempo no puede ser negativo, se restauró el último valor válido: ",
   "扫描时无法访问 {0} 个目录，已跳过": "Se omitieron {0} directorios inaccesibles",
-  "未修改任何文件，取消勾选试运行模式后再次处理将实际写入\n": "No se modific\u00f3 ning\u00fan archivo. Desmarque el modo de simulaci\u00f3n y procese de nuevo para escribir\n",
+  "未修改任何文件，取消勾选试运行模式后再次处理将实际写入\n": "No se modificó ningún archivo. Desmarque el modo de simulación y procese de nuevo para escribir\n",
   "无法创建原文件备份，已中止写入: ": "No se pudo crear una copia de seguridad del archivo original, escritura cancelada: ",
-  "操作被取消": "Operación cancelada"
+  "操作被取消": "Operación cancelada",
+  "ExifTool 进程池已关闭": "Grupo de procesos ExifTool cerrado",
+  "GPS 坐标必须为有限数值": "Las coordenadas GPS deben ser números finitos",
+  "GPS 坐标超出有效范围: ": "Coordenadas GPS fuera del rango válido: ",
+  "GPS 高度必须为有限数值": "La altitud GPS debe ser un número finito",
+  "仍有任务正在处理中。\n强制退出可能中断文件写入并造成数据损坏。\n确定要强制退出吗？": "Todavía hay tareas en curso.\nForzar la salida puede interrumpir la escritura de archivos y dañar los datos.\n¿Forzar la salida?",
+  "参数包含换行符，已回退独立进程模式": "El argumento contiene un salto de línea, se usó el modo de proceso independiente",
+  "文件名包含当前编码无法表示的字符，已回退独立进程模式": "El nombre de archivo contiene caracteres no representables en la codificación actual, se usó el modo de proceso independiente",
+  "无效的 GPS 坐标: ": "Coordenadas GPS no válidas: ",
+  "无效的 GPS 高度: ": "Altitud GPS no válida: ",
+  "任务正在处理中，请等待完成后再切换语言": "Hay tareas en curso, espere a que terminen antes de cambiar el idioma",
+  "文件已被移动或删除: ": "El archivo fue movido o eliminado: ",
+  "无法打开地图链接，请检查默认浏览器设置": "No se pudo abrir el enlace del mapa, verifique la configuración del navegador predeterminado",
+  "时间差阈值必须大于 0，已还原为上次有效值: ": "El umbral de diferencia de tiempo debe ser mayor que 0, se restauró el último valor válido: "
 }

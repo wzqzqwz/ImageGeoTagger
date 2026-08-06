@@ -20,7 +20,7 @@ from utils.media_utils import (
 from utils.exif_utils import (
     update_image_date, update_raw_date,
     update_video_date, update_audio_date, blank_exif_dates,
-    clear_video_date, clear_audio_date
+    clear_video_date, clear_audio_date, extract_media_datetime_exiftool
 )
 
 
@@ -64,9 +64,13 @@ class MediaDateRenamer:
             return False, _("文件不存在: ") + str(file_path), False
 
         # 如果启用了跳过已有日期的选项，检查文件是否已有拍摄日期
-        # 只依据 EXIF/QuickTime 日期判断，文件系统时间不算"已有拍摄日期"
+        # 只依据 EXIF/QuickTime 日期判断，文件系统时间不算"已有拍摄日期"。
+        # RAW/HEIC/WebP/MKV 等格式 exifread/QuickTime 探测不到，
+        # 需用 ExifTool 读取（否则已有日期的文件会被误判为无日期而覆盖）
         if skip_existing:
             dt = get_existing_datetime(file_path, fallback_to_fs=False)
+            if dt is None and file_path.suffix.lower() not in PIE_SUPPORTED_EXTENSIONS:
+                dt = extract_media_datetime_exiftool(file_path)
             if dt is not None and dt != datetime.min:
                 return True, _("跳过已有日期数据的文件"), True
 

@@ -175,7 +175,13 @@ class EditCoordinatesDialog:
         def on_close():
             if self.window in app.edit_windows:
                 app.edit_windows.remove(self.window)
-            self.window.destroy()
+            # 写盘完成回调可能再次触发 on_close（对话框已被用户先关）：
+            # 对已销毁窗口 destroy 会抛 TclError，先确认存活
+            try:
+                if self.window.winfo_exists():
+                    self.window.destroy()
+            except Exception:
+                log_exc()
         self._on_close = on_close
         self.window.protocol("WM_DELETE_WINDOW", on_close)
 
@@ -499,6 +505,11 @@ class EditCoordinatesDialog:
                     self._release_if_acquired()
 
             def _write_job():
+                # 文件可能在编辑期间被外部改名/移动/删除：
+                # 预检后直接报错，避免 ExifTool 命中同目录同名新文件写错数据
+                if not os.path.exists(self.file_info.path):
+                    raise FileNotFoundError(
+                        _("文件已被移动或删除: ") + self.file_info.path)
                 if lat_val is None and lon_val is None:
                     remove_gps_info(self.file_info.path)
                 else:
@@ -718,8 +729,14 @@ class EditCoordinatesDialog:
                 finally:
                     self._release_if_acquired()
 
-            self._async_apply_to_file(
-                lambda: remove_gps_info(self.file_info.path), _finish_clear)
+            def _clear_job():
+                # 文件可能在编辑期间被外部改名/移动/删除：预检后直接报错
+                if not os.path.exists(self.file_info.path):
+                    raise FileNotFoundError(
+                        _("文件已被移动或删除: ") + self.file_info.path)
+                remove_gps_info(self.file_info.path)
+
+            self._async_apply_to_file(_clear_job, _finish_clear)
 
     def _map_selector(self):
         _open_map_selector_async(self.app, self._open_selected_map)

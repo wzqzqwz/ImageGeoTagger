@@ -177,6 +177,18 @@ class MainWindow:
         self._lang_menu_idx = menubar.index('end')
 
     def _switch_lang(self, code):
+        # 处理中切换语言会触发两个标签页 rebuild_ui：重建控件并清空
+        # 结果视图，后台 worker 的队列回调会打到已重建/禁用的控件上
+        # （TclError）并丢失处理结果视图，故处理期间禁止切换
+        with self.lock:
+            busy = self.is_processing
+        if busy:
+            messagebox.showwarning(
+                _("警告"), _("任务正在处理中，请等待完成后再切换语言"),
+                parent=self.root)
+            for c, v in self._lang_vars.items():
+                v.set(c == get_language())
+            return
         for c, v in self._lang_vars.items():
             v.set(c == code)
         set_language(code)
@@ -199,10 +211,22 @@ class MainWindow:
             with self.lock:
                 alive = [t for t in self.background_threads if _thread_is_alive(t)]
             if alive:
-                messagebox.showwarning(
+                # 任务卡死（如 ExifTool 子进程挂起）时用户无法退出，
+                # 提供明确风险提示的强制退出途径，默认不强制
+                force = messagebox.askyesno(
                     _("警告"),
-                    _("正在处理中，请等待当前任务完成后再退出程序"),
+                    _("仍有任务正在处理中。\n强制退出可能中断文件写入并造成数据损坏。\n确定要强制退出吗？"),
                     parent=self.root)
+                if not force:
+                    return
+                # 关闭 ExifTool 常驻进程池，避免强制退出后残留孤儿 perl 进程
+                try:
+                    from utils.exif_utils import close_exiftool_pool
+                    close_exiftool_pool()
+                except Exception:
+                    log_exc()
+                self._closing = True
+                self.root.destroy()
                 return
 
             for win in self.edit_windows:

@@ -68,24 +68,41 @@ def _windows_recycle(file_paths):
     success_count = 0
     failed = []
 
-    for fp in file_paths:
-        if not os.path.exists(fp):
-            failed.append((fp, _("文件不存在")))
-            continue
-        try:
-            path_buf = fp + '\0\0'
-            op = _SHFILEOPSTRUCTW()
-            op.hwnd = None
-            op.wFunc = _FO_DELETE
-            op.pFrom = path_buf
-            op.fFlags = _FOF_ALLOWUNDO | _FOF_NOCONFIRMATION | _FOF_SILENT
-            result = ctypes.windll.shell32.SHFileOperationW(ctypes.byref(op))
-            if result == 0 and not op.fAnyOperationsAborted:
-                success_count += 1
-            else:
-                failed.append((fp, _("错误码: ") + str(result) if result else _("操作被取消")))
-        except Exception as e:
-            failed.append((fp, str(e)))
+    # SHFileOperation 在无 COM 初始化的线程中调用个别环境可能失败：
+    # 官方推荐线程内 CoInitialize（失败可忽略，多数环境无需）
+    co_initialized = False
+    try:
+        import ctypes as _ct
+        if _ct.windll.ole32.CoInitialize(None) == 0:
+            co_initialized = True
+    except Exception:
+        pass
+
+    try:
+        for fp in file_paths:
+            if not os.path.exists(fp):
+                failed.append((fp, _("文件不存在")))
+                continue
+            try:
+                path_buf = fp + '\0\0'
+                op = _SHFILEOPSTRUCTW()
+                op.hwnd = None
+                op.wFunc = _FO_DELETE
+                op.pFrom = path_buf
+                op.fFlags = _FOF_ALLOWUNDO | _FOF_NOCONFIRMATION | _FOF_SILENT
+                result = ctypes.windll.shell32.SHFileOperationW(ctypes.byref(op))
+                if result == 0 and not op.fAnyOperationsAborted:
+                    success_count += 1
+                else:
+                    failed.append((fp, _("错误码: ") + str(result) if result else _("操作被取消")))
+            except Exception as e:
+                failed.append((fp, str(e)))
+    finally:
+        if co_initialized:
+            try:
+                ctypes.windll.ole32.CoUninitialize()
+            except Exception:
+                pass
 
     return success_count, failed
 

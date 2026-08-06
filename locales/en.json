@@ -572,5 +572,18 @@
   "扫描时无法访问 {0} 个目录，已跳过": "Skipped {0} directories that could not be accessed",
   "未修改任何文件，取消勾选试运行模式后再次处理将实际写入\n": "No files were modified. Uncheck dry run mode and process again to actually write\n",
   "无法创建原文件备份，已中止写入: ": "Unable to create a backup of the original file, write aborted: ",
-  "操作被取消": "Operation cancelled"
+  "操作被取消": "Operation cancelled",
+  "ExifTool 进程池已关闭": "ExifTool process pool closed",
+  "GPS 坐标必须为有限数值": "GPS coordinates must be finite numbers",
+  "GPS 坐标超出有效范围: ": "GPS coordinates out of valid range: ",
+  "GPS 高度必须为有限数值": "GPS altitude must be a finite number",
+  "仍有任务正在处理中。\n强制退出可能中断文件写入并造成数据损坏。\n确定要强制退出吗？": "Tasks are still running.\nForcing exit may interrupt file writing and corrupt data.\nForce exit?",
+  "参数包含换行符，已回退独立进程模式": "Argument contains a newline, fell back to standalone process mode",
+  "文件名包含当前编码无法表示的字符，已回退独立进程模式": "Filename contains characters not representable in the current encoding, fell back to standalone process mode",
+  "无效的 GPS 坐标: ": "Invalid GPS coordinates: ",
+  "无效的 GPS 高度: ": "Invalid GPS altitude: ",
+  "任务正在处理中，请等待完成后再切换语言": "Tasks are running, please wait for completion before switching language",
+  "文件已被移动或删除: ": "File was moved or deleted: ",
+  "无法打开地图链接，请检查默认浏览器设置": "Unable to open map link, please check your default browser settings",
+  "时间差阈值必须大于 0，已还原为上次有效值: ": "Time difference threshold must be greater than 0, restored to last valid value: "
 }
