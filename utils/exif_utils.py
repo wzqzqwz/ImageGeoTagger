@@ -1080,10 +1080,12 @@ def _validate_exiftool_result(stdout_text, stderr_text, strict, file_path, tool_
         # ExifTool 13.x 经 Unicode API 传参，对编码只打 Warning（可正常写入），
         # 且部分 charset 名（cp936/GB2312）会被拒绝，此时不应进入重试。
         if "Error: FileName encoding" in stderr:
-            # 老版本 ExifTool（10.x）无 Unicode 传参支持，需指定系统代码页
-            # 字符集重试。重试失败时透传原始错误，避免误报为编码问题。
+            # 老版本 ExifTool（10.x）无 Unicode 传参支持，需指定文件名字符集重试。
+            # Windows 按系统活动代码页映射；Unix 系统默认 UTF-8（65001）。
+            # 重试失败时透传原始错误，避免误报为编码问题。
             charset_name = {936: 'GB2312', 932: 'ShiftJIS', 949: 'KSC',
-                            950: 'Big5'}.get(_system_codepage(), 'Latin1')
+                            950: 'Big5', 65001: 'UTF8'}.get(
+                                _system_codepage(), 'UTF8' if os.name != 'nt' else 'Latin1')
             try:
                 out2, err2 = _execute_exiftool(
                     tool_path, ['-charset', 'filename=' + charset_name] + list(args),

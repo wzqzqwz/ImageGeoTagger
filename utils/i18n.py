@@ -45,6 +45,14 @@ def _detect_system_lang():
                     return code
         except Exception:
             pass
+    # Linux/macOS 兜底：LANG 环境变量（如 zh_CN.UTF-8 → zh）
+    try:
+        env = os.environ.get('LANG', '')
+        code = env.split('.')[0].split('_')[0].lower()
+        if code in _SUPPORTED:
+            return code
+    except Exception:
+        pass
     return 'en'
 
 def load_lang(lang_code=None):

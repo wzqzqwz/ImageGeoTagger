@@ -12,7 +12,7 @@
 
 ## 系统要求
 
-- Windows 7+ / macOS 10.12+ / Linux (X11)
+- Windows 7+ / macOS 10.12+ / Linux (X11 桌面环境)
 - Python 3.9+
 - ExifTool（可选但推荐，用于 RAW/视频/音频文件处理）
 
@@ -28,6 +28,32 @@ pip install -r requirements.txt
 
 # 运行
 python -m main
+```
+
+## 各平台环境准备
+
+### Windows
+
+- 自带 `exiftool/exiftool.exe`（项目内已内置，无需额外安装）
+- Python 从 [python.org](https://www.python.org) 安装（勾选 tcl/tk 组件）
+
+### Linux (Debian/Ubuntu 示例)
+
+```bash
+sudo apt install python3 python3-tk
+pip install -r requirements.txt
+# 可选依赖：
+#   ExifTool（RAW/视频/音频处理）：sudo apt install libimage-exiftool-perl
+#   xdg-utils（打开文件/文件夹）：sudo apt install xdg-utils
+#   gio 或 trash-cli（移至回收站）：sudo apt install trash-cli
+```
+
+### macOS
+
+```bash
+brew install python-tk
+pip install -r requirements.txt
+# 可选：brew install exiftool
 ```
 
 ## 项目结构
@@ -62,12 +88,19 @@ icons/                    # 图标
 ImageGeoTagger.spec       # PyInstaller 打包配置
 ```
 
-## 打包为独立 exe
+## 打包为独立可执行文件
 
 ```bash
 pip install pyinstaller
 pyinstaller ImageGeoTagger.spec
 ```
+
+- 必须在**目标操作系统**上打包（PyInstaller 不支持跨平台交叉编译）
+- 生成产物：`dist/ImageGeoTagger`（macOS/Linux）或 `dist/ImageGeoTagger.exe`（Windows）
+- 打包前请将 `exiftool/` 目录替换为当前平台对应的 ExifTool：
+  - Windows：`exiftool.exe`
+  - macOS/Linux：`exiftool` 脚本（macOS 可用 `brew install exiftool` 后复制，Linux 同理）
+- spec 已按平台自动选择图标（Windows `.ico` / macOS `.icns` / Linux `.png`）与 UPX 压缩
 
 ## 多语言支持
 

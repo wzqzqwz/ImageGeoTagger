@@ -203,6 +203,8 @@ class ResultsWindow:
             # 点击只会抖动行序，直接忽略
             if col == 'seq':
                 return
+            # 排序前按对象记住选中（此路径不经过 do_search）
+            remember_selection()
             if sort_column == col:
                 sort_reverse = not sort_reverse
             else:
@@ -238,6 +240,25 @@ class ResultsWindow:
             size_str = f"{item.file_size / 1024 / 1024:.2f} MB" if item.file_size else _("未知")
             return (i + 1, item.filename, time_str, loc_str, size_str)
 
+        saved_selection = []
+
+        def remember_selection():
+            # 在 filtered_data 被替换/重排之前，把当前选中按文件对象记录下来
+            # （Treeview 选中按 iid 记录，重排后 iid 会指向别的行，
+            # 必须在旧数据仍可解析时捕获，供 update_display 按对象恢复）
+            nonlocal saved_selection
+            saved_selection = []
+            try:
+                for iid in tree.selection():
+                    try:
+                        idx = tree.index(iid)
+                    except tk.TclError:
+                        continue
+                    if 0 <= idx < len(filtered_data):
+                        saved_selection.append(filtered_data[idx])
+            except Exception:
+                saved_selection = []
+
         def update_display():
             # 行级增量更新：仅更新值/新增/删除尾部行，避免大列表时整树重建
             children = tree.get_children()
@@ -250,6 +271,14 @@ class ResultsWindow:
                 tree.insert('', 'end', values=_format_row(i, filtered_data[i]))
             for i in range(common, n_old):
                 tree.delete(children[i])
+            # 按对象恢复选中：仍在列表中的保留选中，已移出/被删的取消选中
+            if saved_selection:
+                wanted = set(id(o) for o in saved_selection)
+                new_sel = [tree.get_children()[i]
+                           for i, item in enumerate(filtered_data)
+                           if id(item) in wanted]
+                tree.selection_set(*new_sel)
+                saved_selection.clear()
 
         search_job = [None]
 
@@ -263,6 +292,8 @@ class ResultsWindow:
             except Exception:
                 return
             text = search_var.get().lower().strip()
+            # 旧 filtered_data 即将被替换：先按对象记住选中
+            remember_selection()
             filtered_data.clear()
             if not text:
                 filtered_data.extend(original_data)

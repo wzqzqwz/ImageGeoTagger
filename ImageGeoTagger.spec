@@ -2,6 +2,8 @@
 
 import os
 import sys
+import platform as _platform
+import shutil
 
 block_cipher = None
 
@@ -10,6 +12,27 @@ entry_point = os.path.join(app_dir, '__main__.py')
 locale_dir = os.path.join(app_dir, 'locales')
 icon_dir = os.path.join(app_dir, 'icons')
 exiftool_dir = os.path.join(app_dir, 'exiftool')
+
+# 平台相关设置：Windows 用 .ico，macOS 用 .icns，Linux 用 .png；
+# UPX 仅在系统存在时启用（macOS/Linux 默认未安装，显式关闭避免告警噪音）
+_system = _platform.system()
+_icon_path = None
+if _system == 'Windows':
+    for cand in [os.path.join(app_dir, 'icon.ico'), os.path.join(icon_dir, 'icon.ico')]:
+        if os.path.isfile(cand):
+            _icon_path = cand
+            break
+elif _system == 'Darwin':
+    for cand in [os.path.join(app_dir, 'icon.icns'), os.path.join(icon_dir, 'icon.icns')]:
+        if os.path.isfile(cand):
+            _icon_path = cand
+            break
+else:
+    for cand in [os.path.join(icon_dir, 'icon.png'), os.path.join(app_dir, 'icon.png')]:
+        if os.path.isfile(cand):
+            _icon_path = cand
+            break
+_upx = shutil.which('upx') is not None
 
 # Generate datas list for exiftool directory recursively
 exiftool_datas = []
@@ -55,7 +78,7 @@ exe = EXE(
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
+    upx=_upx,
     upx_exclude=[],
     runtime_tmpdir=None,
     console=False,
@@ -64,5 +87,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=os.path.join(app_dir, 'icons', 'icon.ico'),
+    icon=_icon_path,
 )
