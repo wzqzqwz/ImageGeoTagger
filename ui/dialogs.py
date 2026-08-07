@@ -446,58 +446,14 @@ class EditCoordinatesDialog:
             old_lat, old_lon = self.file_info.latitude, self.file_info.longitude
             self._old_lat, self._old_lon = old_lat, old_lon
 
-            needs_batch = False
-            same_loc_files = []
-            if old_lat is not None and old_lon is not None and lat_val is not None and lon_val is not None:
-                if abs(old_lat - lat_val) > 1e-6 or abs(old_lon - lon_val) > 1e-6:
-                    same_loc_files = find_files_with_same_location(
-                        self.app, old_lat, old_lon,
-                        self.file_info.altitude, tolerance=1e-6)
-                    same_loc_files = [f for f in same_loc_files
-                                      if f is not self.file_info]
-                    if same_loc_files:
-                        msg = (_("发现 ") + str(len(same_loc_files))
-                               + _(" 个文件与 '") + self.file_info.filename + "'\n"
-                               + _("具有相同的位置 (") + f"{old_lat:.8f}, {old_lon:.8f}" + _(")。\n\n")
-                               + _("是否要将这些文件的位置也一并更新？"))
-                        dlg = tk.Toplevel(self.window)
-                        dlg.title(_("确认批量修改"))
-                        dlg.transient(self.window)
-                        dlg.grab_set()
-                        ttk.Label(dlg, text=msg, wraplength=380, justify=tk.LEFT,
-                                 padding=12).pack(fill=tk.BOTH, expand=True)
-                        bf = ttk.Frame(dlg)
-                        bf.pack(pady=6)
-                        dlg.update_idletasks()
-                        x = self.window.winfo_rootx() + self.window.winfo_width() // 2 - dlg.winfo_reqwidth() // 2
-                        y = self.window.winfo_rooty() + self.window.winfo_height() // 2 - dlg.winfo_reqheight() // 2
-                        dlg.geometry(f"+{max(0,x)}+{max(0,y)}")
-                        dlg.resizable(False, False)
-                        result = [0]
-                        def set_result(v):
-                            result[0] = v
-                            dlg.destroy()
-                        ttk.Button(bf, text=_("修改当前"),
-                                  command=lambda: set_result(1)).pack(side=tk.LEFT, padx=5)
-                        ttk.Button(bf, text=_("全部修改"),
-                                  command=lambda: set_result(2)).pack(side=tk.LEFT, padx=5)
-                        ttk.Button(bf, text=_("取消"),
-                                  command=lambda: set_result(0)).pack(side=tk.LEFT, padx=5)
-                        dlg.protocol("WM_DELETE_WINDOW", lambda: set_result(0))
-                        self.window.wait_window(dlg)
-                        if result[0] == 0:
-                            self._release_if_acquired()
-                            return
-                        needs_batch = (result[0] == 2)
-
             def _finish_apply():
                 try:
                     self.file_info.latitude = lat_val
                     self.file_info.longitude = lon_val
                     self.file_info.altitude = alt_val
 
-                    if needs_batch and same_loc_files:
-                        self._start_same_location_batch(lat_val, lon_val, alt_val, same_loc_files)
+                    if self._needs_batch and self._same_loc_files:
+                        self._start_same_location_batch(lat_val, lon_val, alt_val, self._same_loc_files)
                         return
                     self._finalize_save()
                 except Exception:
@@ -524,7 +480,34 @@ class EditCoordinatesDialog:
                     else:
                         update_image_gps(self.file_info.path, loc_info)
 
-            self._async_apply_to_file(_write_job, _finish_apply)
+            # 旧位置存在且坐标发生变化时需扫描相同位置文件并弹确认框。
+            # 该扫描是 O(n) 纯内存遍历，万级文件时同步执行会冻结 UI：
+            # 移到 worker 线程，完成后回主线程弹框（_on_same_loc_scan_done）
+            self._needs_batch = False
+            self._same_loc_files = []
+            self._pending_write_job = _write_job
+            self._pending_finish_apply = _finish_apply
+            need_scan = (old_lat is not None and old_lon is not None
+                         and lat_val is not None and lon_val is not None
+                         and (abs(old_lat - lat_val) > 1e-6 or abs(old_lon - lon_val) > 1e-6))
+            if not need_scan:
+                self._async_apply_to_file(_write_job, _finish_apply)
+                return
+
+            def _scan_worker():
+                try:
+                    files = find_files_with_same_location(
+                        self.app, old_lat, old_lon,
+                        self.file_info.altitude, tolerance=1e-6)
+                except Exception:
+                    log_exc()
+                    files = []
+                files = [f for f in files if f is not self.file_info]
+                self.app.post_to_ui(lambda fl=files: self._on_same_loc_scan_done(fl))
+
+            t = threading.Thread(target=_scan_worker, daemon=True)
+            self.app.register_thread(t)
+            t.start()
 
         except ValueError:
             try:
@@ -538,6 +521,60 @@ class EditCoordinatesDialog:
                 messagebox.showerror(_("错误"), _("操作失败"), parent=self.window)
             except Exception:
                 log_exc()
+            self._release_if_acquired()
+
+    def _on_same_loc_scan_done(self, same_loc_files):
+        """同位置文件扫描完成（主线程回调）：弹批量修改确认框后继续写盘
+
+        扫描在 worker 线程执行（避免大列表时冻结 UI）；若扫描期间用户
+        已关闭对话框则只释放互斥锁，不再弹框。
+        """
+        try:
+            if not self._dialog_alive():
+                self._release_if_acquired()
+                return
+            needs_batch = False
+            if same_loc_files:
+                msg = (_("发现 ") + str(len(same_loc_files))
+                       + _(" 个文件与 '") + self.file_info.filename + "'\n"
+                       + _("具有相同的位置 (") + f"{self._old_lat:.8f}, {self._old_lon:.8f}" + _(")。\n\n")
+                       + _("是否要将这些文件的位置也一并更新？"))
+                dlg = tk.Toplevel(self.window)
+                dlg.title(_("确认批量修改"))
+                dlg.transient(self.window)
+                dlg.grab_set()
+                ttk.Label(dlg, text=msg, wraplength=380, justify=tk.LEFT,
+                         padding=12).pack(fill=tk.BOTH, expand=True)
+                bf = ttk.Frame(dlg)
+                bf.pack(pady=6)
+                dlg.update_idletasks()
+                x = self.window.winfo_rootx() + self.window.winfo_width() // 2 - dlg.winfo_reqwidth() // 2
+                y = self.window.winfo_rooty() + self.window.winfo_height() // 2 - dlg.winfo_reqheight() // 2
+                dlg.geometry(f"+{max(0,x)}+{max(0,y)}")
+                dlg.resizable(False, False)
+                result = [0]
+                def set_result(v):
+                    result[0] = v
+                    dlg.destroy()
+                ttk.Button(bf, text=_("修改当前"),
+                          command=lambda: set_result(1)).pack(side=tk.LEFT, padx=5)
+                ttk.Button(bf, text=_("全部修改"),
+                          command=lambda: set_result(2)).pack(side=tk.LEFT, padx=5)
+                ttk.Button(bf, text=_("取消"),
+                          command=lambda: set_result(0)).pack(side=tk.LEFT, padx=5)
+                dlg.protocol("WM_DELETE_WINDOW", lambda: set_result(0))
+                self.window.wait_window(dlg)
+                if result[0] == 0:
+                    self._release_if_acquired()
+                    return
+                needs_batch = (result[0] == 2)
+            self._needs_batch = needs_batch
+            self._same_loc_files = same_loc_files if needs_batch else []
+            write_job, finish_apply = self._pending_write_job, self._pending_finish_apply
+            self._pending_write_job = self._pending_finish_apply = None
+            self._async_apply_to_file(write_job, finish_apply)
+        except Exception:
+            log_exc()
             self._release_if_acquired()
 
     def _release_if_acquired(self):
@@ -1271,7 +1308,9 @@ class BatchDateEditDialog:
             if rw and hasattr(rw, 'progress_bar'):
                 rw.progress_bar['value'] = value
                 rw.progress_label.config(text=text)
-                rw.window.update()
+                # 只用 update_idletasks 刷新控件，避免 update() 全量排空
+                # 事件循环造成回调重入（与 BatchLocationEditDialog 一致）
+                rw.window.update_idletasks()
         except Exception:
             log_exc()
 
@@ -1286,7 +1325,7 @@ class BatchDateEditDialog:
             if rw and hasattr(rw, 'progress_bar'):
                 rw.progress_bar['value'] = 100
                 rw.progress_label.config(text=_("完成: ") + str(success) + _("成功/") + str(failed) + _("失败"))
-                rw.window.update()
+                rw.window.update_idletasks()
         except Exception:
             log_exc()
         if self.tree:
@@ -1469,7 +1508,10 @@ class BatchLocationEditDialog:
                             parent=self.window)
                     except Exception:
                         log_exc()
-                    return
+                return
+        except tk.TclError:
+            # 系统剪贴板为空/无 STRING 内容：属正常状态，不记录为错误
+            pass
         except Exception:
             log_exc()
 

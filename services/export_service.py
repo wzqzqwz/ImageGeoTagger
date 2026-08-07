@@ -20,6 +20,20 @@ def _get_val(item, key, default=None):
     return getattr(item, key, default)
 
 
+def _naive_dt(dt):
+    """datetime 统一转本地 naive，避免 min/max 混比 aware/naive 抛 TypeError
+
+    与 geo_processor._to_utc_naive / media_scanner._sort_key 的归一化基准一致：
+    带时区值先转本地时间再剥离 tzinfo。
+    """
+    if dt is not None and dt.tzinfo is not None:
+        try:
+            return dt.astimezone().replace(tzinfo=None)
+        except Exception:
+            return dt
+    return dt
+
+
 def csv_safe(value):
     """CSV 单元格防公式注入：以 = + - @ \\t \\r 开头的值加单引号前缀
 
@@ -65,7 +79,7 @@ def export_to_txt(filepath, a_list, b_list, gps_data, stats_text):
                     if alt is not None:
                         f.write(", " + _("高度: ") + f"{alt:.2f}m")
                     f.write("\n")
-                f.write(_("   来源: ") + _get_val(point, 'source_file', _('未知')) + "\n\n")
+                f.write(_("   来源: ") + (_get_val(point, 'source_file') or _('未知')) + "\n\n")
 
 
 def _write_file_info_txt(f, i, item):
@@ -226,7 +240,7 @@ def generate_statistics(a_list, b_list, gps_data,
     if gps_data:
         stats += "\n" + _("GPX轨迹数据统计:") + "\n"
         stats += INDENT + _("轨迹点总数: ") + str(len(gps_data)) + "\n"
-        times = [_get_val(p, 'datetime') for p in gps_data if _get_val(p, 'datetime')]
+        times = [_naive_dt(_get_val(p, 'datetime')) for p in gps_data if _get_val(p, 'datetime')]
         if times:
             min_t, max_t = min(times), max(times)
             stats += INDENT + _("时间跨度: ") + min_t.strftime('%Y-%m-%d %H:%M:%S') + _(" 到 ") + max_t.strftime('%Y-%m-%d %H:%M:%S') + "\n"
@@ -254,7 +268,7 @@ def generate_statistics(a_list, b_list, gps_data,
             alts.append(alt)
         dt = _get_val(item, 'dt')
         if dt:
-            with_time.append(dt)
+            with_time.append(_naive_dt(dt))
         total_size += _get_val(item, 'file_size') or 0
 
     for ext, count in sorted(file_types.items()):

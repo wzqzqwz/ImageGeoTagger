@@ -88,6 +88,10 @@ class DateTab:
         self.date_renamer = MediaDateRenamer(dry_run=True)
         self.selected_directory = tk.StringVar()
         self.operation_mode = tk.StringVar(value="change_date")
+        # 上次真正生效的模式：_on_mode_change 被扫描/处理守卫拦截时
+        # 变量已被 tkinter 改写，需还原到该值（见 _on_mode_change 说明）
+        self._applied_mode = "change_date"
+        self._exporting = False
         self.dry_run = tk.BooleanVar(value=True)
         self.recursive = tk.BooleanVar(value=True)
         self.skip_existing = tk.BooleanVar(value=True)
@@ -348,14 +352,20 @@ class DateTab:
                 return
 
     def _on_mode_change(self):
+        # Radiobutton 的 command 回调触发时，变量已被 tkinter 先改写为新值，
+        # 无法从变量本身取回旧值：_applied_mode 记录上次真正生效的模式，
+        # 被守卫拦截时还原到它，避免 UI 与变量错位、后续处理按错误模式执行
         if getattr(self, '_processing', False):
             # 处理中不允许切换模式，避免主线程改写 fi['status'] 与 worker 并发
             messagebox.showwarning(_("警告"), _("正在处理中，请等待当前任务完成"))
+            self.operation_mode.set(self._applied_mode)
             return
         if getattr(self, '_scanning', False):
             # 扫描中同样禁止切换，避免扫描结果状态与当前 UI 模式不一致
             messagebox.showwarning(_("警告"), _("正在扫描中，请等待扫描完成"))
+            self.operation_mode.set(self._applied_mode)
             return
+        self._applied_mode = self.operation_mode.get()
         mode = self.operation_mode.get()
         if mode == "change_date":
             self.process_btn.config(text=_("开始更改日期"))
@@ -658,6 +668,10 @@ class DateTab:
         if getattr(self, '_processing', False):
             messagebox.showwarning(_("警告"), _("正在处理中，请等待当前任务完成"))
             return
+        if getattr(self, '_scanning', False):
+            # 扫描中列表即将被替换：对旧快照改名会白做并让用户误以为成功
+            messagebox.showwarning(_("警告"), _("正在扫描中，请等待扫描完成"))
+            return
         if not file_info:
             return
         # 全局互斥：防止与地理页后台 GPS 写盘等并发写同一文件导致损坏
@@ -722,6 +736,9 @@ class DateTab:
     def _batch_rename_items(self, selected_items, path_to_file):
         if getattr(self, '_processing', False):
             messagebox.showwarning(_("警告"), _("正在处理中，请等待当前任务完成"))
+            return
+        if getattr(self, '_scanning', False):
+            messagebox.showwarning(_("警告"), _("正在扫描中，请等待扫描完成"))
             return
         to_rename = []
         for item_id in selected_items:
@@ -850,6 +867,10 @@ class DateTab:
             return
 
         self._scanning = True
+        # 扫描期间禁用模式单选/处理/扫描等控件：扫描线程已快照模式值，
+        # 用户此时改模式会被 _on_mode_change 拦截（变量还原由该函数兜底），
+        # 直接禁用从根源上避免 UI 与扫描数据模式错位
+        self._set_ui_processing_state(True)
         scan_mode = self.operation_mode.get()
         scan_skip_with_date = self.skip_files_with_date.get()
         thread = threading.Thread(
@@ -952,6 +973,7 @@ class DateTab:
                 lambda: self._append_log(_("扫描失败\n")))
         finally:
             self.app.post_to_ui(lambda: setattr(self, '_scanning', False))
+            self.app.post_to_ui(lambda: self._set_ui_processing_state(False))
             self.app.post_to_ui(self.app.release_processing)
 
     def _update_preview(self):
@@ -1494,6 +1516,9 @@ class DateTab:
         if getattr(self, '_processing', False):
             messagebox.showwarning(_("警告"), _("正在处理中，请等待当前任务完成"))
             return
+        if getattr(self, '_scanning', False):
+            messagebox.showwarning(_("警告"), _("正在扫描中，请等待扫描完成"))
+            return
         files_to_process = []
         skipped_no_date = []
         skipped_not_ready = []
@@ -1666,6 +1691,9 @@ class DateTab:
         if getattr(self, '_scanning', False):
             messagebox.showwarning(_("警告"), _("正在扫描中，请等待扫描完成"))
             return
+        if getattr(self, '_exporting', False):
+            messagebox.showwarning(_("警告"), _("正在导出，请稍候"))
+            return
         if not self.files_to_process:
             messagebox.showwarning(_("警告"), _("没有可导出的数据"))
             return
@@ -1678,33 +1706,54 @@ class DateTab:
         if not filename:
             return
 
-        try:
-            ext = os.path.splitext(filename)[1].lower()
-            if ext == '.txt':
-                with open(filename, 'w', encoding='utf-8', newline='') as f:
-                    f.write(_("媒体文件处理结果报告") + "\n")
-                    f.write("=" * 60 + "\n\n")
-                    for i, fi in enumerate(self.files_to_process, 1):
-                        f.write(f"{i}. {fi.get('filename', '')}\n")
-                        f.write(_("   拍摄日期: ") + (fi.get('original_date') or '') + "\n")
-                        f.write(_("   文件名日期: ") + (fi.get('new_date') or '') + "\n")
-                        f.write(_("   状态: ") + status_text(fi.get('status'), fi.get('status_detail', '')) + "\n")
-                        f.write("-" * 40 + "\n")
-            else:
-                with open(filename, 'w', newline='', encoding='utf-8-sig') as f:
-                    w = csv.writer(f)
-                    w.writerow([_('文件名'), _('文件路径'), _('拍摄时间'), _('文件名日期'), _('状态'), _('操作模式')])
-                    for fi in self.files_to_process:
-                        w.writerow([
-                            csv_safe(fi.get('filename', '')),
-                            csv_safe(str(fi.get('path', ''))),
-                            fi.get('original_date') or '',
-                            fi.get('new_date') or '',
-                            status_text(fi.get('status'), fi.get('status_detail', '')),
-                            # 直接取当前模式：_export_mode 只在处理开始时更新，
-                            # 用户处理后再切换模式导出会导出陈旧值
-                            self.operation_mode.get(),
-                        ])
-            messagebox.showinfo(_("成功"), _("文件已保存到:\n") + filename)
-        except Exception as e:
-            messagebox.showerror(_("错误"), _("导出失败:\n") + str(e))
+        # 写盘移入 worker 线程，避免万级文件时逐行写盘冻结 UI；
+        # 快照在锁下拷贝，扫描完成整体替换列表不影响本次导出的一致性
+        with self.app.lock:
+            snapshot = list(self.files_to_process)
+        ext = os.path.splitext(filename)[1].lower()
+        mode = self.operation_mode.get()
+
+        def worker():
+            try:
+                if ext == '.txt':
+                    with open(filename, 'w', encoding='utf-8', newline='') as f:
+                        f.write(_("媒体文件处理结果报告") + "\n")
+                        f.write("=" * 60 + "\n\n")
+                        for i, fi in enumerate(snapshot, 1):
+                            f.write(f"{i}. {fi.get('filename', '')}\n")
+                            f.write(_("   拍摄日期: ") + (fi.get('original_date') or '') + "\n")
+                            f.write(_("   文件名日期: ") + (fi.get('new_date') or '') + "\n")
+                            f.write(_("   状态: ") + status_text(fi.get('status'), fi.get('status_detail', '')) + "\n")
+                            f.write("-" * 40 + "\n")
+                else:
+                    with open(filename, 'w', newline='', encoding='utf-8-sig') as f:
+                        w = csv.writer(f)
+                        w.writerow([_('文件名'), _('文件路径'), _('拍摄时间'), _('文件名日期'), _('状态'), _('操作模式')])
+                        for fi in snapshot:
+                            w.writerow([
+                                csv_safe(fi.get('filename', '')),
+                                csv_safe(str(fi.get('path', ''))),
+                                fi.get('original_date') or '',
+                                fi.get('new_date') or '',
+                                status_text(fi.get('status'), fi.get('status_detail', '')),
+                                # 导出开始时的模式：与快照数据一致，
+                                # 避免导出期间切换模式导致模式与数据错位
+                                mode,
+                            ])
+                self.app.post_to_ui(lambda: messagebox.showinfo(
+                    _("成功"), _("文件已保存到:\n") + filename))
+            except Exception as e:
+                log_exc()
+                self.app.post_to_ui(lambda e=str(e): messagebox.showerror(
+                    _("错误"), _("导出失败:\n") + e))
+            finally:
+                self.app.post_to_ui(lambda: setattr(self, '_exporting', False))
+                self.app.post_to_ui(lambda: self._btn_export.config(
+                    state="disabled" if getattr(self, '_processing', False)
+                    or getattr(self, '_scanning', False) else "normal"))
+
+        self._exporting = True
+        self._btn_export.config(state="disabled")
+        t = threading.Thread(target=worker, daemon=True)
+        self.app.register_thread(t)
+        t.start()

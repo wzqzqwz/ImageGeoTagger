@@ -40,6 +40,8 @@ class GeoTab:
         self.result_window = None
         # 上次有效的时间差阈值缓存（首次非法输入时用于还原）
         self._threshold_min_cache = DEFAULT_TIME_THRESHOLD_MINUTES
+        # 导出进行中标志：防止重复点击并发写同一文件
+        self._exporting = False
 
         self.create_interface()
 
@@ -618,6 +620,9 @@ class GeoTab:
         if self.is_thread_running():
             messagebox.showwarning(_("处理中"), _("请等待当前任务完成"))
             return
+        if getattr(self, '_exporting', False):
+            messagebox.showwarning(_("处理中"), _("正在导出，请稍候"))
+            return
         with self.app.lock:
             has_data = bool(self.app.a) or bool(self.app.b)
         if not has_data:
@@ -637,28 +642,53 @@ class GeoTab:
         if not export_file:
             return
 
-        try:
-            ext = os.path.splitext(export_file)[1].lower()
-            gps_data_list = [p.to_dict() if hasattr(p, 'to_dict') else p
-                            for p in self.app.gps_data]
+        # 主线程只弹保存对话框；写盘移入 worker 线程，避免万级文件时
+        # 逐条写盘冻结 UI。快照在全局锁下拷贝，导出期间后台任务
+        # 并发修改列表不影响本次导出内容的一致性
+        with self.app.lock:
+            a_snap = list(self.app.a)
+            b_snap = list(self.app.b)
+            gps_snap = list(self.app.gps_data)
+            init_a = self.app.initial_a_count
+            init_b = self.app.initial_b_count
+            upd = self.app.updated_count
+        ext = os.path.splitext(export_file)[1].lower()
 
-            if ext == '.csv':
-                export_to_csv(export_file, self.app.a, self.app.b)
-            elif ext == '.json':
-                export_to_json(export_file, self.app.a, self.app.b, gps_data_list)
-            elif ext == '.gpx':
-                export_to_gpx(export_file, self.app.a)
-            else:
-                stats = generate_statistics(
-                    self.app.a, self.app.b, gps_data_list,
-                    initial_a_count=self.app.initial_a_count,
-                    initial_b_count=self.app.initial_b_count,
-                    updated_count=self.app.updated_count)
-                export_to_txt(export_file, self.app.a, self.app.b,
-                            gps_data_list, stats)
+        def worker():
+            try:
+                gps_data_list = [p.to_dict() if hasattr(p, 'to_dict') else p
+                                for p in gps_snap]
+                if ext == '.csv':
+                    export_to_csv(export_file, a_snap, b_snap)
+                elif ext == '.json':
+                    export_to_json(export_file, a_snap, b_snap, gps_data_list)
+                elif ext == '.gpx':
+                    export_to_gpx(export_file, a_snap)
+                else:
+                    stats = generate_statistics(
+                        a_snap, b_snap, gps_data_list,
+                        initial_a_count=init_a,
+                        initial_b_count=init_b,
+                        updated_count=upd)
+                    export_to_txt(export_file, a_snap, b_snap,
+                                gps_data_list, stats)
+                self.app.post_to_ui(lambda: self.show_messagebox(
+                    "info", _("导出成功"),
+                    _("结果已成功导出到:\n") + export_file))
+            except Exception as e:
+                log_exc()
+                self.app.post_to_ui(lambda e=str(e): self.show_messagebox(
+                    "error", _("导出失败"),
+                    _("导出时发生错误:\n") + e))
+            finally:
+                # 导出结束恢复按钮；期间若有后台任务启动，
+                # 按钮状态由 update_ui_state 统一管理，不覆盖
+                self.app.post_to_ui(lambda: self._btn_export.config(
+                    state="disabled" if self.is_thread_running() else "normal"))
+                self.app.post_to_ui(lambda: setattr(self, '_exporting', False))
 
-            self.show_messagebox("info", _("导出成功"),
-                                _("结果已成功导出到:\n") + export_file)
-        except Exception as e:
-            self.show_messagebox("error", _("导出失败"),
-                                _("导出时发生错误:\n") + str(e))
+        self._exporting = True
+        self._btn_export.config(state="disabled")
+        t = threading.Thread(target=worker, daemon=True)
+        self.app.register_thread(t)
+        t.start()

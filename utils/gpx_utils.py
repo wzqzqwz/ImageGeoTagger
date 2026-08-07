@@ -334,8 +334,18 @@ def create_gpx_element(points, name="Image Geo Data"):
         return (dt_val is not None
                 and 1971 <= dt_val.year <= 2037)
 
+    def _naive_dt(dt_val):
+        # 统一转本地 naive 再排序，避免混合 aware/naive 抛 TypeError
+        # （与 export_service._naive_dt 语义一致）
+        if dt_val is not None and dt_val.tzinfo is not None:
+            try:
+                return dt_val.astimezone().replace(tzinfo=None)
+            except Exception:
+                return dt_val
+        return dt_val
+
     sorted_items = sorted(
-        [p for p in points
+        [dict(p, datetime=_naive_dt(p.get('datetime'))) for p in points
          if _valid_dt(p.get('datetime'))
          and p.get('latitude') is not None
          and p.get('longitude') is not None],
