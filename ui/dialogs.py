@@ -362,6 +362,9 @@ class EditCoordinatesDialog:
                     self.clip_status_var.set(
                         _("剪贴板: ") + f"({lat_str}, {lon_str})" + _(" | 来源: 系统剪贴板"))
                 return
+        except tk.TclError:
+            # 系统剪贴板为空/无 STRING 内容：属正常状态，不记录为错误
+            pass
         except Exception:
             log_exc()
 
@@ -1509,9 +1512,6 @@ class BatchLocationEditDialog:
                     except Exception:
                         log_exc()
                 return
-        except tk.TclError:
-            # 系统剪贴板为空/无 STRING 内容：属正常状态，不记录为错误
-            pass
         except Exception:
             log_exc()
 
