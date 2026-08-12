@@ -585,5 +585,6 @@
   "任务正在处理中，请等待完成后再切换语言": "Tasks are running, please wait for completion before switching language",
   "文件已被移动或删除: ": "File was moved or deleted: ",
   "无法打开地图链接，请检查默认浏览器设置": "Unable to open map link, please check your default browser settings",
-  "时间差阈值必须大于 0，已还原为上次有效值: ": "Time difference threshold must be greater than 0, restored to last valid value: "
+  "时间差阈值必须大于 0，已还原为上次有效值: ": "Time difference threshold must be greater than 0, restored to last valid value: ",
+  "正在导出，请稍候": "Exporting, please wait"
 }
