@@ -312,6 +312,10 @@ class EditCoordinatesDialog:
             result = self._parse_coordinates(content)
             if result:
                 lat_str, lon_str, alt_str = result
+        except tk.TclError:
+            # 系统剪贴板为空/无 STRING 内容：属正常状态，静默跳过，
+            # 与 _update_clip_status 轮询处的 TclError 处理对齐
+            pass
         except Exception:
             log_exc()
 

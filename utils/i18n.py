@@ -40,7 +40,7 @@ def _detect_system_lang():
             lcid = ctypes.windll.kernel32.GetUserDefaultUILanguage()
             name = locale.windows_locale.get(lcid)
             if name:
-                code = name.split('_')[0]
+                code = name.split('_')[0].lower()
                 if code in _SUPPORTED:
                     return code
         except Exception:

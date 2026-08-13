@@ -613,7 +613,7 @@ def to_degrees(value):
     """将十进制度数转换为 (度, 分, 秒) 格式（带进位处理）
 
     EXIF 标准使用度/分/秒的分数形式存储 GPS 坐标。
-    例如：116.39747° 转换为 ((116,1), (23,1), (1430892,1e6))
+    例如：116.39747° 转换为 ((116,1), (23,1), (50892000,1e6))
 
     采用整数运算（秒分辨率 1/1e6 ≈ 2.8e-10 度 ≈ 0.003 厘米）：
       - 避免浮点乘除产生长尾小数（如 0.0399999999999992）
@@ -1140,30 +1140,30 @@ def update_video_gps(file_path, location_info):
         file_path: 视频文件路径
         location_info: 包含 latitude, longitude, altitude 的字典
     """
-    _validate_location(location_info)
+    lat, lon, alt = _validate_location(location_info)
     orig_atime, orig_mtime = _get_stat(file_path)
 
     # 尝试五种不同的写入方法，支持不同视频格式的元数据容器。
     # 只有 lat/lon 参与容器探测；高度单独用 XMP 组补写（见下），
     # 因为 Keys/QuickTime/UserData 组大多不支持 GPSAltitude。
     methods = [
-        [f'-Keys:GPSCoordinates={location_info["latitude"]},{location_info["longitude"]}',
-         f'-Keys:GPSLatitude={location_info["latitude"]}',
-         f'-Keys:GPSLongitude={location_info["longitude"]}'],
-        [f'-QuickTime:GPSCoordinates={location_info["latitude"]},{location_info["longitude"]}',
-         f'-QuickTime:GPSLatitude={location_info["latitude"]}',
-         f'-QuickTime:GPSLongitude={location_info["longitude"]}'],
-        [f'-XMP:GPSLatitude={location_info["latitude"]}',
-         f'-XMP:GPSLongitude={location_info["longitude"]}',
-         f'-XMP:GPSLatitudeRef={"N" if location_info["latitude"] >= 0 else "S"}',
-         f'-XMP:GPSLongitudeRef={"E" if location_info["longitude"] >= 0 else "W"}'],
-        [f'-UserData:GPSCoordinates={location_info["latitude"]},{location_info["longitude"]}',
-         f'-UserData:GPSLatitude={location_info["latitude"]}',
-         f'-UserData:GPSLongitude={location_info["longitude"]}'],
-        [f'-GPSLatitude={location_info["latitude"]}',
-         f'-GPSLongitude={location_info["longitude"]}',
-         f'-GPSLatitudeRef={"N" if location_info["latitude"] >= 0 else "S"}',
-         f'-GPSLongitudeRef={"E" if location_info["longitude"] >= 0 else "W"}']
+        [f'-Keys:GPSCoordinates={lat},{lon}',
+         f'-Keys:GPSLatitude={lat}',
+         f'-Keys:GPSLongitude={lon}'],
+        [f'-QuickTime:GPSCoordinates={lat},{lon}',
+         f'-QuickTime:GPSLatitude={lat}',
+         f'-QuickTime:GPSLongitude={lon}'],
+        [f'-XMP:GPSLatitude={lat}',
+         f'-XMP:GPSLongitude={lon}',
+         f'-XMP:GPSLatitudeRef={"N" if lat >= 0 else "S"}',
+         f'-XMP:GPSLongitudeRef={"E" if lon >= 0 else "W"}'],
+        [f'-UserData:GPSCoordinates={lat},{lon}',
+         f'-UserData:GPSLatitude={lat}',
+         f'-UserData:GPSLongitude={lon}'],
+        [f'-GPSLatitude={lat}',
+         f'-GPSLongitude={lon}',
+         f'-GPSLatitudeRef={"N" if lat >= 0 else "S"}',
+         f'-GPSLongitudeRef={"E" if lon >= 0 else "W"}']
     ]
 
     # 多方法共用一份备份：避免每个方法都对大文件整文件复制，
@@ -1183,13 +1183,13 @@ def update_video_gps(file_path, location_info):
 
         # 高度独立补写：只有 XMP 组（及标准 GPS 组）支持 GPSAltitude，
         # 覆盖 Keys/QuickTime/UserData 容器。高度写入失败不回滚已成功的 lat/lon。
-        if success and location_info.get('altitude') is not None:
+        if success and alt is not None:
             try:
                 alt_method = [
-                    f'-XMP:GPSAltitude={abs(location_info["altitude"])}',
-                    f'-XMP:GPSAltitudeRef={"0" if location_info["altitude"] >= 0 else "1"}',
-                    f'-GPSAltitude={abs(location_info["altitude"])}',
-                    f'-GPSAltitudeRef={"0" if location_info["altitude"] >= 0 else "1"}',
+                    f'-XMP:GPSAltitude={abs(alt)}',
+                    f'-XMP:GPSAltitudeRef={"0" if alt >= 0 else "1"}',
+                    f'-GPSAltitude={abs(alt)}',
+                    f'-GPSAltitudeRef={"0" if alt >= 0 else "1"}',
                 ]
                 _run_exiftool(alt_method, file_path, strict=True,
                               external_backup=backup_path)
@@ -1218,17 +1218,17 @@ def update_audio_gps(file_path, location_info):
         file_path: 音频文件路径
         location_info: 包含 latitude, longitude, altitude 的字典
     """
-    _validate_location(location_info)
+    lat, lon, alt = _validate_location(location_info)
     orig_atime, orig_mtime = _get_stat(file_path)
     methods = [
-        [f'-XMP:GPSLatitude={location_info["latitude"]}',
-         f'-XMP:GPSLongitude={location_info["longitude"]}',
-         f'-XMP:GPSLatitudeRef={"N" if location_info["latitude"] >= 0 else "S"}',
-         f'-XMP:GPSLongitudeRef={"E" if location_info["longitude"] >= 0 else "W"}'],
-        [f'-GPSLatitude={location_info["latitude"]}',
-         f'-GPSLongitude={location_info["longitude"]}',
-         f'-GPSLatitudeRef={"N" if location_info["latitude"] >= 0 else "S"}',
-         f'-GPSLongitudeRef={"E" if location_info["longitude"] >= 0 else "W"}']
+        [f'-XMP:GPSLatitude={lat}',
+         f'-XMP:GPSLongitude={lon}',
+         f'-XMP:GPSLatitudeRef={"N" if lat >= 0 else "S"}',
+         f'-XMP:GPSLongitudeRef={"E" if lon >= 0 else "W"}'],
+        [f'-GPSLatitude={lat}',
+         f'-GPSLongitude={lon}',
+         f'-GPSLatitudeRef={"N" if lat >= 0 else "S"}',
+         f'-GPSLongitudeRef={"E" if lon >= 0 else "W"}']
     ]
 
     # 多方法共用一份备份（见 update_video_gps 说明）
@@ -1245,12 +1245,12 @@ def update_audio_gps(file_path, location_info):
                 log_exc()
                 continue
 
-    # 高度独立补写（音频同视频：XMP 组支持 GPSAltitude）
-        if success and location_info.get('altitude') is not None:
+        # 高度独立补写（音频同视频：XMP 组支持 GPSAltitude）
+        if success and alt is not None:
             try:
                 _run_exiftool([
-                    f'-XMP:GPSAltitude={abs(location_info["altitude"])}',
-                    f'-XMP:GPSAltitudeRef={"0" if location_info["altitude"] >= 0 else "1"}',
+                    f'-XMP:GPSAltitude={abs(alt)}',
+                    f'-XMP:GPSAltitudeRef={"0" if alt >= 0 else "1"}',
                 ], file_path, strict=True, external_backup=backup_path)
             except Exception:
                 log_exc()

@@ -10,5 +10,5 @@
 """
 
 # 软件版本号和作者信息
-__version__ = "3.1.6"
+__version__ = "3.1.7"
 __author__ = "wzqzqwz"

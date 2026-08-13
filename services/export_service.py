@@ -9,6 +9,7 @@ from collections.abc import Mapping
 from utils.gpx_utils import create_gpx_element, prettify_xml
 from utils.i18n import _
 from utils.media_utils import format_gps_coord
+from utils.datetime_utils import to_local_naive
 
 
 def _get_val(item, key, default=None):
@@ -18,20 +19,6 @@ def _get_val(item, key, default=None):
     if key == 'datetime' and not hasattr(item, 'datetime') and hasattr(item, 'timestamp'):
         return getattr(item, 'timestamp', default)
     return getattr(item, key, default)
-
-
-def _naive_dt(dt):
-    """datetime 统一转本地 naive，避免 min/max 混比 aware/naive 抛 TypeError
-
-    与 geo_processor._to_utc_naive / media_scanner._sort_key 的归一化基准一致：
-    带时区值先转本地时间再剥离 tzinfo。
-    """
-    if dt is not None and dt.tzinfo is not None:
-        try:
-            return dt.astimezone().replace(tzinfo=None)
-        except Exception:
-            return dt
-    return dt
 
 
 def csv_safe(value):
@@ -240,7 +227,7 @@ def generate_statistics(a_list, b_list, gps_data,
     if gps_data:
         stats += "\n" + _("GPX轨迹数据统计:") + "\n"
         stats += INDENT + _("轨迹点总数: ") + str(len(gps_data)) + "\n"
-        times = [_naive_dt(_get_val(p, 'datetime')) for p in gps_data if _get_val(p, 'datetime')]
+        times = [to_local_naive(_get_val(p, 'datetime')) for p in gps_data if _get_val(p, 'datetime')]
         if times:
             min_t, max_t = min(times), max(times)
             stats += INDENT + _("时间跨度: ") + min_t.strftime('%Y-%m-%d %H:%M:%S') + _(" 到 ") + max_t.strftime('%Y-%m-%d %H:%M:%S') + "\n"
@@ -268,7 +255,7 @@ def generate_statistics(a_list, b_list, gps_data,
             alts.append(alt)
         dt = _get_val(item, 'dt')
         if dt:
-            with_time.append(_naive_dt(dt))
+            with_time.append(to_local_naive(dt))
         total_size += _get_val(item, 'file_size') or 0
 
     for ext, count in sorted(file_types.items()):

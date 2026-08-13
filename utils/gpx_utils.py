@@ -10,6 +10,7 @@ import os
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from utils.logging_utils import log_exc
+from utils.datetime_utils import to_local_naive
 
 try:
     from defusedxml import ElementTree as SafeET
@@ -334,18 +335,8 @@ def create_gpx_element(points, name="Image Geo Data"):
         return (dt_val is not None
                 and 1971 <= dt_val.year <= 2037)
 
-    def _naive_dt(dt_val):
-        # 统一转本地 naive 再排序，避免混合 aware/naive 抛 TypeError
-        # （与 export_service._naive_dt 语义一致）
-        if dt_val is not None and dt_val.tzinfo is not None:
-            try:
-                return dt_val.astimezone().replace(tzinfo=None)
-            except Exception:
-                return dt_val
-        return dt_val
-
     sorted_items = sorted(
-        [dict(p, datetime=_naive_dt(p.get('datetime'))) for p in points
+        [dict(p, datetime=to_local_naive(p.get('datetime'))) for p in points
          if _valid_dt(p.get('datetime'))
          and p.get('latitude') is not None
          and p.get('longitude') is not None],
@@ -361,7 +352,7 @@ def create_gpx_element(points, name="Image Geo Data"):
 
         for item in sorted_items:
             trkpt = ET.SubElement(trkseg, "trkpt")
-            # 6 位小数与手机照片 EXIF 精度一致（1e-6 度 ≈ 11 厘米）
+            # 8 位小数（1e-8 度 ≈ 1 毫米），与 format_gps_coord 的显示精度一致
             trkpt.set("lat", f"{item['latitude']:.8f}")
             trkpt.set("lon", f"{item['longitude']:.8f}")
             if item.get('altitude') is not None:

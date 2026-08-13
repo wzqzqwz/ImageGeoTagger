@@ -32,28 +32,28 @@ def setup_logging():
             return
         _initialized = True
 
-    logger = logging.getLogger(_LOGGER_NAME)
-    if logger.handlers:
-        return
-    logger.setLevel(logging.DEBUG)
-    fmt = logging.Formatter(
-        '%(asctime)s %(levelname)s [%(threadName)s] %(message)s')
+        logger = logging.getLogger(_LOGGER_NAME)
+        if logger.handlers:
+            return
+        logger.setLevel(logging.DEBUG)
+        fmt = logging.Formatter(
+            '%(asctime)s %(levelname)s [%(threadName)s] %(message)s')
 
-    try:
-        os.makedirs(_LOG_DIR, exist_ok=True)
-        fh = RotatingFileHandler(_LOG_FILE, maxBytes=2 * 1024 * 1024,
-                                 backupCount=3, encoding='utf-8')
-        fh.setFormatter(fmt)
-        logger.addHandler(fh)
-    except OSError:
-        pass
+        try:
+            os.makedirs(_LOG_DIR, exist_ok=True)
+            fh = RotatingFileHandler(_LOG_FILE, maxBytes=2 * 1024 * 1024,
+                                     backupCount=3, encoding='utf-8')
+            fh.setFormatter(fmt)
+            logger.addHandler(fh)
+        except OSError:
+            pass
 
-    try:
-        sh = logging.StreamHandler(sys.stderr)
-        sh.setFormatter(fmt)
-        logger.addHandler(sh)
-    except Exception:
-        pass
+        try:
+            sh = logging.StreamHandler(sys.stderr)
+            sh.setFormatter(fmt)
+            logger.addHandler(sh)
+        except Exception:
+            pass
 
 
 def get_logger():
@@ -79,12 +79,10 @@ def log_exc(context=''):
         # 非异常上下文：format_exc() 只会产生 "NoneType: None" 垃圾日志
         return ''
     tb = traceback.format_exc()
+    # setup_logging 幂等（已初始化或有 handler 时直接返回），
+    # 此处统一确保 handler 就绪后再写日志
+    setup_logging()
     logger = logging.getLogger(_LOGGER_NAME)
-    if logger.handlers:
-        pass
-    else:
-        setup_logging()
-        logger = logging.getLogger(_LOGGER_NAME)
     if context:
         logger.error('%s | %s', context, tb.rstrip())
     else:

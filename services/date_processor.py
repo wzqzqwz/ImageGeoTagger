@@ -127,7 +127,7 @@ def update_file_shooting_date(file_path, new_datetime, file_ext):
 def clear_file_shooting_date(file_path, file_ext):
     """清除媒体文件的拍摄日期
 
-    将日期标记设置为 Unix 纪元（1970:01:01 00:00:00），
+    将日期标记设置为 0001:01:01 00:00:00，
     而非直接删除标签，以保持文件结构完整。
 
     Args:

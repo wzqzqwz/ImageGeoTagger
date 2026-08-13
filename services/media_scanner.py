@@ -26,7 +26,11 @@ from utils.i18n import _
 
 
 def _sort_key(x):
-    """按拍摄时间排序的键：带时区的值统一转本地 naive 再比较"""
+    """按拍摄时间排序的键：带时区的值统一转本地 naive 再比较
+
+    归一化基准与 utils.datetime_utils.to_local_naive 一致；此处额外将
+    无日期值/异常值兜底为 datetime.min，以满足排序键必须可比较的需求。
+    """
     dt = x.dt if x.dt else datetime.min
     if dt.tzinfo is not None:
         try:
@@ -109,27 +113,28 @@ def scan_folder(folder_path, progress_callback=None, only_process_with_date=Fals
     # 线程数设为 CPU 核心数的 2 倍，最大 32
     _last_log_pct = -1
     _log_lock = threading.Lock()
-    with ThreadPoolExecutor(max_workers=min(32, (os.cpu_count() or 4) * 2)) as pool:
-        futs = {pool.submit(_extract_file_info, p, only_process_with_date): p for p in files}
-        done = 0
-        for fut in as_completed(futs):
+    done = 0
+
+    def _drain(pending):
+        """处理一批已完成的 future，并清空 pending 以便继续分块提交"""
+        nonlocal skipped_count, done, _last_log_pct
+        for fut in as_completed(pending):
+            pending.pop(fut, None)
+            done += 1
             try:
                 info = fut.result()
             except Exception:
                 log_exc()
-                done += 1
                 continue
             # 如果设置了只处理有日期的文件，跳过无日期的
             if only_process_with_date and info.dt is None:
                 skipped_count += 1
-                done += 1
                 continue
             # 根据是否有 GPS 信息分类
             if info.latitude is not None and info.longitude is not None:
                 a_list.append(info)
             else:
                 b_list.append(info)
-            done += 1
             pct = int(done / total * 100)
             if progress_callback and (done % 10 == 0 or done == total):
                 progress_callback(pct)
@@ -138,6 +143,17 @@ def scan_folder(folder_path, progress_callback=None, only_process_with_date=Fals
                     if pct > _last_log_pct:
                         _last_log_pct = pct
                         log_callback(done, total)
+
+    with ThreadPoolExecutor(max_workers=min(32, (os.cpu_count() or 4) * 2)) as pool:
+        # 分块提交，避免超大目录一次性持有全部 Future 对象导致内存峰值
+        # （与 date_tab._scan_thread 的分块策略一致）
+        pending = {}
+        for p in files:
+            pending[pool.submit(_extract_file_info, p, only_process_with_date)] = p
+            if len(pending) >= 500:
+                _drain(pending)
+        if pending:
+            _drain(pending)
 
     # 按拍摄时间排序两个列表（带时区值统一转本地 naive 再比较，
     # 与 geo_processor 的匹配基准一致，避免 aware/naive 混比抛 TypeError）

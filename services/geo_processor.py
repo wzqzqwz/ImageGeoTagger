@@ -26,6 +26,7 @@ from utils.exif_utils import (
 )
 from utils.i18n import _
 from utils.logging_utils import log_exc
+from utils.datetime_utils import to_local_naive
 
 
 def _get_dt(obj):
@@ -46,12 +47,10 @@ def _to_utc_naive(dt):
     需要 UI 层提供时区修正选项（当前未实现）。
 
     若 dt 已是 naive datetime，直接返回。
+
+    实现委托 utils.datetime_utils.to_local_naive，与导出/GPX 侧归一化一致。
     """
-    if dt is None:
-        return None
-    if dt.tzinfo is not None:
-        return dt.astimezone().replace(tzinfo=None)
-    return dt
+    return to_local_naive(dt)
 
 
 def process_location_info(a_list, b_list, gps_data,

@@ -20,6 +20,7 @@ from ui.tk_safe import pulse_progress, safe_after
 from utils.i18n import _
 from utils.logging_utils import log_exc
 from utils.media_utils import format_gps_coord
+from utils.datetime_utils import to_local_naive
 
 
 class ResultsWindow:
@@ -794,7 +795,8 @@ class ResultsWindow:
 
     def _show_gpx_stats(self, points):
         count = len(points)
-        times = [p['datetime'] for p in points if p.get('datetime')]
+        # 归一化后再 min/max：避免混合 aware/naive 时间比较抛 TypeError
+        times = [to_local_naive(p['datetime']) for p in points if p.get('datetime')]
         lats = [p['latitude'] for p in points if p.get('latitude') is not None]
         lons = [p['longitude'] for p in points if p.get('longitude') is not None]
         alts = [p['altitude'] for p in points if p.get('altitude') is not None]
