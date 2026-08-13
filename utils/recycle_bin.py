@@ -127,7 +127,7 @@ def _macos_trash(file_paths):
                 ['osascript', '-e',
                  'tell application "Finder" to delete (POSIX file "' + safe_path + '" as POSIX file)'],
                 capture_output=True, text=True, timeout=15,
-                errors='replace'
+                errors='replace', encoding='utf-8'
             )
             if result.returncode == 0:
                 success_count += 1
@@ -160,12 +160,14 @@ def _linux_trash(file_paths):
             if trash_cmd == 'gio':
                 result = subprocess.run(
                     ['gio', 'trash', fp],
-                    capture_output=True, text=True, timeout=15, errors='replace'
+                    capture_output=True, text=True, timeout=15, errors='replace',
+                    encoding='utf-8'
                 )
             elif trash_cmd == 'trash-put':
                 result = subprocess.run(
                     ['trash-put', fp],
-                    capture_output=True, text=True, timeout=15, errors='replace'
+                    capture_output=True, text=True, timeout=15, errors='replace',
+                    encoding='utf-8'
                 )
             else:
                 failed.append((fp, _("未找到垃圾箱工具（需要安装 gio 或 trash-put）")))

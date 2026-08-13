@@ -128,8 +128,11 @@ def show_file_in_explorer(file_path):
     system = platform.system()
     try:
         if system == "Windows":
-            # /select, 必须与路径连成单个参数，拆开时带空格路径无法定位文件
-            subprocess.run(['explorer', '/select,' + abs_path], check=False, timeout=5)
+            # /select, 与路径须分开传参：subprocess 会分别为含空格的路径加引号
+            # （生成 `explorer /select, "D:\...\Lrc Smart Previews.lrdata\..."`）。
+            # 若合并成单个参数（'/select,' + 路径），explorer 会把含空格路径
+            # 截断（只取到空格前一段），定位失败并回退到默认位置（文档）。
+            subprocess.run(['explorer', '/select,', abs_path], check=False, timeout=5)
         elif system == "Darwin":
             subprocess.run(['open', '-R', abs_path], check=False, timeout=5)
         else:

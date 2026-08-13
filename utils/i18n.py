@@ -45,6 +45,24 @@ def _detect_system_lang():
                     return code
         except Exception:
             pass
+    elif sys.platform == 'darwin':
+        # macOS：GUI 应用通常无 LANG 环境变量、locale 未初始化，
+        # 用 defaults read -g AppleLanguages 读取系统首选语言
+        # （输出形如 ( "zh-Hans-CN", "en-CN" )，取首个的 BCP-47 前缀）。
+        try:
+            import subprocess
+            import re
+            out = subprocess.run(
+                ['defaults', 'read', '-g', 'AppleLanguages'],
+                capture_output=True, text=True, timeout=3, errors='replace')
+            if out.returncode == 0:
+                m = re.search(r'"([^"]+)"', out.stdout)
+                if m:
+                    lang = m.group(1).split('-')[0].lower()
+                    if lang in _SUPPORTED:
+                        return lang
+        except Exception:
+            pass
     # Linux/macOS 兜底：LANG 环境变量（如 zh_CN.UTF-8 → zh）
     try:
         env = os.environ.get('LANG', '')
